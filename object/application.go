@@ -444,7 +444,22 @@ func GetApplicationByOrganizationName(organization string) (*Application, error)
 
 func GetApplicationByUser(user *User) (*Application, error) {
 	if user.SignupApplication != "" {
-		return getApplication("admin", user.SignupApplication)
+		application, err := getApplication("admin", user.SignupApplication)
+		if err != nil {
+			return nil, err
+		}
+		if application != nil {
+			return application, nil
+		}
+
+		// fallback: the application may be owned by the user's organization instead of "admin"
+		application, err = getApplication(user.Owner, user.SignupApplication)
+		if err != nil {
+			return nil, err
+		}
+		if application != nil {
+			return application, nil
+		}
 	}
 
 	// users without a signup application should get the organization's default one

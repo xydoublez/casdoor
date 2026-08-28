@@ -6,6 +6,7 @@
 *.dylib
 *.swp
 /server_*
+/casdoor.tar.gz
 
 # Test binary, built with `go test -c`
 *.test
