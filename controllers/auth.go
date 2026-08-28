@@ -148,6 +148,16 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 		}
 	}
 
+	// Revoke the tokens of the displaced login before the response is built, otherwise the
+	// token that this login creates below would be revoked too
+	if application.EnableExclusiveSignin {
+		_, err = object.ExpireTokenByUserAndApplication(user.Owner, user.Name, application.Name)
+		if err != nil {
+			c.ResponseError(err.Error(), nil)
+			return
+		}
+	}
+
 	if user.NeedUpdatePassword {
 		// no credential may be issued here, otherwise the requirement could be bypassed
 		// by reading the credential from the response of this API directly
@@ -721,12 +731,17 @@ func (c *ApiController) Login() {
 				c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s does not exist"), authForm.Application))
 				return
 			}
-			if authForm.SigninMethod == "Password" && !application.IsPasswordEnabled() {
+			// Every request reaching this branch carries a password and is authenticated
+			// by it, no matter which "signinMethod" the client claims. So the check can
+			// not be limited to signinMethod == "Password", otherwise an empty or unknown
+			// signinMethod would bypass the disabled password login
+			if authForm.SigninMethod == "LDAP" {
+				if !application.IsLdapEnabled() {
+					c.ResponseError(c.T("auth:The login method: login with LDAP is not enabled for the application"))
+					return
+				}
+			} else if !application.IsPasswordEnabled() {
 				c.ResponseError(c.T("auth:The login method: login with password is not enabled for the application"))
-				return
-			}
-			if authForm.SigninMethod == "LDAP" && !application.IsLdapEnabled() {
-				c.ResponseError(c.T("auth:The login method: login with LDAP is not enabled for the application"))
 				return
 			}
 
