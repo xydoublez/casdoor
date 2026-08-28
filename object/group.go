@@ -295,7 +295,13 @@ func ConvertToTreeData(groups []*Group, parentId string) []*Group {
 	treeData := []*Group{}
 
 	for _, group := range groups {
-		if group.ParentId == parentId {
+		// LDAP-synced top-level groups may have ParentId empty and IsTopGroup set,
+		// while manually created top-level groups have ParentId equal to the owner.
+		// Accept both forms so the tree root is populated regardless of the source.
+		isRootNode := parentId == group.Owner && (group.ParentId == "" || group.IsTopGroup || group.ParentId == parentId)
+		// A self-referencing group (ParentId == Name) must not become its own child,
+		// otherwise the recursion will overflow the stack.
+		if (group.ParentId == parentId || isRootNode) && group.Name != parentId {
 			node := &Group{
 				Title: group.DisplayName,
 				Key:   group.Name,

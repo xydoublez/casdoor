@@ -85,6 +85,9 @@ type LdapUser struct {
 	PostalAddress         string
 	Country               string `json:"country"`
 	CountryName           string `json:"countryName"`
+	Title                 string `json:"title"`
+	Organization          string `json:"organization"`
+	Company               string `json:"company"`
 
 	GroupId    string            `json:"groupId"`
 	Address    string            `json:"address"`
@@ -200,7 +203,7 @@ func (l *LdapConn) GetLdapUsers(ldapServer *Ldap) ([]LdapUser, error) {
 	SearchAttributes := []string{
 		"uidNumber", "cn", "sn", "gidNumber", "entryUUID", "displayName", "mail", "email",
 		"emailAddress", "telephoneNumber", "mobile", "mobileTelephoneNumber", "registeredAddress", "postalAddress",
-		"c", "co", "memberOf",
+		"c", "co", "memberOf", "title", "o", "company",
 	}
 	if l.IsAD {
 		SearchAttributes = append(SearchAttributes, "sAMAccountName")
@@ -276,6 +279,12 @@ func (l *LdapConn) GetLdapUsers(ldapServer *Ldap) ([]LdapUser, error) {
 				user.Country = attribute.Values[0]
 			case "co":
 				user.CountryName = attribute.Values[0]
+			case "title":
+				user.Title = attribute.Values[0]
+			case "o":
+				user.Organization = attribute.Values[0]
+			case "company":
+				user.Company = attribute.Values[0]
 			case "memberOf":
 				user.MemberOf = attribute.Values
 			default:
@@ -431,22 +440,69 @@ func AutoAdjustLdapUser(users []LdapUser) []LdapUser {
 	res := make([]LdapUser, len(users))
 	for i, user := range users {
 		res[i] = LdapUser{
-			UidNumber:   user.UidNumber,
-			Uid:         user.Uid,
-			Cn:          user.Cn,
-			GroupId:     user.GidNumber,
-			Uuid:        user.GetLdapUuid(),
-			DisplayName: user.DisplayName,
-			Email:       util.ReturnAnyNotEmpty(user.Email, user.EmailAddress, user.Mail),
-			Mobile:      util.ReturnAnyNotEmpty(user.Mobile, user.MobileTelephoneNumber, user.TelephoneNumber),
-			Address:     util.ReturnAnyNotEmpty(user.Address, user.PostalAddress, user.RegisteredAddress),
-			Country:     util.ReturnAnyNotEmpty(user.Country, user.CountryName),
-			CountryName: user.CountryName,
-			MemberOf:    user.MemberOf,
-			Attributes:  user.Attributes,
+			UidNumber:    user.UidNumber,
+			Uid:          user.Uid,
+			Cn:           user.Cn,
+			GroupId:      user.GidNumber,
+			Uuid:         user.GetLdapUuid(),
+			DisplayName:  user.DisplayName,
+			Email:        util.ReturnAnyNotEmpty(user.Email, user.EmailAddress, user.Mail),
+			Mobile:       util.ReturnAnyNotEmpty(user.Mobile, user.MobileTelephoneNumber, user.TelephoneNumber),
+			Address:      util.ReturnAnyNotEmpty(user.Address, user.PostalAddress, user.RegisteredAddress),
+			Country:      util.ReturnAnyNotEmpty(user.Country, user.CountryName),
+			CountryName:  user.CountryName,
+			Title:        user.Title,
+			Organization: user.Organization,
+			Company:      user.Company,
+			MemberOf:     user.MemberOf,
+			Attributes:   user.Attributes,
 		}
 	}
 	return res
+}
+
+// applyLdapCustomAttributes applies the LDAP server's CustomAttributes mapping
+// (LDAP attribute name -> user property name) onto the user's real fields, the
+// same way syncers such as the Active Directory syncer do (e.g. "department" ->
+// "affiliation", "title" -> "title"). It returns the names of the columns that
+// were actually changed. Property names without a matching user field are
+// ignored here; they are already kept in the user's Properties.
+func applyLdapCustomAttributes(user *User, attributes map[string]string) []string {
+	if len(attributes) == 0 {
+		return nil
+	}
+
+	var columns []string
+	setField := func(changed bool, column string, apply func()) {
+		if !changed {
+			return
+		}
+		apply()
+		columns = append(columns, column)
+	}
+
+	for propName, value := range attributes {
+		if value == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(propName)) {
+		case "affiliation":
+			setField(user.Affiliation != value, "affiliation", func() { user.Affiliation = value })
+		case "title":
+			setField(user.Title != value, "title", func() { user.Title = value })
+		case "tag":
+			setField(user.Tag != value, "tag", func() { user.Tag = value })
+		case "bio":
+			setField(user.Bio != value, "bio", func() { user.Bio = value })
+		case "location":
+			setField(user.Location != value, "location", func() { user.Location = value })
+		case "region":
+			setField(user.Region != value, "region", func() { user.Region = value })
+		case "homepage":
+			setField(user.Homepage != value, "homepage", func() { user.Homepage = value })
+		}
+	}
+	return columns
 }
 
 func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string) (existUsers []LdapUser, failedUsers []LdapUser, err error) {
@@ -526,6 +582,34 @@ func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string) (existUser
 					columns = append(columns, "uid_number")
 				}
 			}
+			// Re-sync profile fields from LDAP (only overwrite when LDAP provides a value).
+			if syncUser.Mobile != "" {
+				user.Phone = syncUser.Mobile
+				formatUserPhone(user)
+				columns = append(columns, "phone")
+			}
+			if affiliation := util.ReturnAnyNotEmpty(syncUser.Organization, syncUser.Company, affiliation); affiliation != "" && affiliation != user.Affiliation {
+				user.Affiliation = affiliation
+				columns = append(columns, "affiliation")
+			}
+			if syncUser.Title != "" && syncUser.Title != user.Title {
+				user.Title = syncUser.Title
+				columns = append(columns, "title")
+			}
+			// Custom attribute mappings configured on the LDAP server override
+			// the built-in fields above (e.g. "department" -> "affiliation").
+			for _, column := range applyLdapCustomAttributes(user, syncUser.Attributes) {
+				exists := false
+				for _, c := range columns {
+					if c == column {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					columns = append(columns, column)
+				}
+			}
 
 			affected, err := UpdateUser(user.GetId(), user, columns, false)
 			if err != nil {
@@ -559,13 +643,15 @@ func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string) (existUser
 				CountryCode:       syncUser.Country,
 				Address:           []string{syncUser.Address},
 				Region:            util.ReturnAnyNotEmpty(syncUser.Country, syncUser.CountryName),
-				Affiliation:       affiliation,
+				Affiliation:       util.ReturnAnyNotEmpty(syncUser.Organization, syncUser.Company, affiliation),
+				Title:             syncUser.Title,
 				Tag:               tag,
 				Score:             score,
 				Ldap:              syncUser.Uuid,
 				UidNumber:         parsePosixNumber(syncUser.UidNumber),
 				Properties:        syncUser.Attributes,
 			}
+			applyLdapCustomAttributes(newUser, syncUser.Attributes)
 			formatUserPhone(newUser)
 
 			userGroups := buildLdapUserGroups(organization.Name, ldap, syncUser.MemberOf, existingGroupNameSet, nil)
@@ -707,7 +793,7 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 
 		if ldapGroup.ParentDn == "" || ldapGroup.ParentDn == ldap.BaseDn {
 			isTopGroup = true
-			parentId = ""
+			parentId = owner
 		} else {
 			// Process parent first
 			if parentGroup, exists := dnToGroup[ldapGroup.ParentDn]; exists {
@@ -718,15 +804,26 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 				parentId = dnToGroupName(owner, ldapGroup.ParentDn)
 			} else {
 				isTopGroup = true
+				parentId = owner
 			}
 		}
+
+		// An LDAP entry can share its parent's name (e.g. cn=X inside ou=X):
+		// linking the group to itself would break the tree hierarchy, so the
+		// existing hierarchy (set by the OU entry) must be kept instead.
+		selfParent := parentId == groupName && !isTopGroup
 
 		// Check if group already exists
 		if existingGroup, exists := existingGroupMap[groupName]; exists {
 			// Update existing group
 			existingGroup.DisplayName = ldapGroup.Name
-			existingGroup.ParentId = parentId
-			existingGroup.IsTopGroup = isTopGroup
+			if !selfParent {
+				existingGroup.ParentId = parentId
+				existingGroup.IsTopGroup = isTopGroup
+			} else {
+				existingGroup.ParentId = owner
+				existingGroup.IsTopGroup = true
+			}
 			existingGroup.Type = "ldap-synced"
 			existingGroup.UpdatedTime = util.GetCurrentTime()
 			// Adopt the LDAP gid without overwriting one already assigned in Casdoor.
@@ -739,7 +836,11 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 				updatedGroups++
 			}
 		} else {
-			// Create new group
+			// Create new group (self-parent entries are created top-level)
+			if selfParent {
+				parentId = owner
+				isTopGroup = true
+			}
 			newGroup := &Group{
 				Owner:       owner,
 				Name:        groupName,

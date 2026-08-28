@@ -53,6 +53,9 @@ func (syncer *Syncer) syncUsers() error {
 
 	var affiliationMap map[int]string
 	if syncer.AffiliationTable != "" {
+		if syncer.Ormer == nil {
+			return fmt.Errorf("The affiliation table is only supported for database syncers, please clear the affiliation table field")
+		}
 		_, affiliationMap, err = syncer.getAffiliationMap()
 		if err != nil {
 			line := fmt.Sprintf("[%s] %s\n", util.GetCurrentTime(), err.Error())

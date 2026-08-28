@@ -16,6 +16,7 @@ package util
 
 import (
 	"fmt"
+	"runtime/debug"
 
 	"github.com/beego/beego/v2/core/logs"
 )
@@ -30,7 +31,7 @@ func SafeGoroutine(fn func()) {
 				if !ok {
 					err = fmt.Errorf("%v", r)
 				}
-				logs.Error("goroutine panic: %v", err)
+				logs.Error("goroutine panic: %v\n%s", err, debug.Stack())
 			}
 		}()
 		fn()

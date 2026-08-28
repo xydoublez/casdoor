@@ -155,6 +155,9 @@ func (adapter *Adapter) InitAdapter() error {
 	var dataSourceName string
 	if adapter.UseSameDb || adapter.isBuiltIn() {
 		driverName = conf.GetConfigString("driverName")
+		if driverName == "sqlite3" {
+			driverName = "sqlite"
+		}
 		dataSourceName = conf.GetConfigString("dataSourceName")
 		if conf.GetConfigString("driverName") == "mysql" {
 			dataSourceName = dataSourceName + conf.GetConfigString("dbName")
