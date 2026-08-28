@@ -1,0 +1,9 @@
+{
+  "skills": [
+    {
+      "name": "sync-ad-to-casdoor",
+      "description": "Set up and execute AD-to-Casdoor synchronization via LDAP integration, including user sync via API and org tree sync via auto-sync",
+      "lastAccessedAt": 1787108936698
+    }
+  ]
+}
