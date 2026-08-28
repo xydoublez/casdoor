@@ -43,3 +43,8 @@ web/cypress/screenshots/
 casdoor.tar.gz
 /__pycache__
 /out
+app-pg.conf
+web2/build.log
+web/build.log
+__pycache__/
+.qoder/

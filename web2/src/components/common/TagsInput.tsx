@@ -5,17 +5,25 @@ import {Input} from "@/components/ui/input";
 import {cn} from "@/lib/utils";
 
 interface TagsInputProps {
-  value: string[];
+  value: string[] | string | null | undefined;
   onChange: (value: string[]) => void;
   placeholder?: string;
   disabled?: boolean;
   className?: string;
 }
 
+const normalizeItems = (value: TagsInputProps["value"]): string[] => {
+  if (Array.isArray(value)) return value.filter((v) => typeof v === "string");
+  if (typeof value === "string") {
+    return value === "" ? [] : value.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
+};
+
 /** Free-form list of strings, replacing antd's `<Select mode="tags" />`. */
 export function TagsInput({value, onChange, placeholder, disabled, className}: TagsInputProps) {
   const [draft, setDraft] = React.useState("");
-  const items = value ?? [];
+  const items = normalizeItems(value);
 
   const commit = () => {
     const next = draft.trim();

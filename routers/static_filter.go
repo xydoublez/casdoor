@@ -40,29 +40,26 @@ var (
 )
 
 func getWebBuildFolder() string {
-	path := "web/build"
-	if util.FileExist(filepath.Join(path, "index.html")) || frontendBaseDir == "" {
-		return path
+	defaultPath := "web/build"
+
+	if frontendBaseDir != "" {
+		if util.FileExist(filepath.Join(frontendBaseDir, "index.html")) {
+			return frontendBaseDir
+		}
+		nested := filepath.Join(frontendBaseDir, "web/build")
+		if util.FileExist(filepath.Join(nested, "index.html")) {
+			return nested
+		}
+		casdoorDir := filepath.Join(filepath.Dir(frontendBaseDir), "casdoor")
+		if util.FileExist(filepath.Join(casdoorDir, "index.html")) {
+			return casdoorDir
+		}
+		if util.FileExist(filepath.Join(casdoorDir, "web/build", "index.html")) {
+			return filepath.Join(casdoorDir, "web/build")
+		}
 	}
 
-	if util.FileExist(filepath.Join(frontendBaseDir, "index.html")) {
-		return frontendBaseDir
-	}
-
-	path = filepath.Join(frontendBaseDir, "web/build")
-	if util.FileExist(filepath.Join(path, "index.html")) {
-		return path
-	}
-
-	casdoorDir := filepath.Join(filepath.Dir(frontendBaseDir), "casdoor")
-	if util.FileExist(filepath.Join(casdoorDir, "index.html")) {
-		return casdoorDir
-	}
-	if util.FileExist(filepath.Join(casdoorDir, "web/build", "index.html")) {
-		return filepath.Join(casdoorDir, "web/build")
-	}
-
-	return path
+	return defaultPath
 }
 
 func fastAutoSignin(ctx *context.Context) (string, error) {

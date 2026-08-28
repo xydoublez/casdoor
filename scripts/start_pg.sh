@@ -25,11 +25,13 @@
 #   RADIUS_PORT=0             # RADIUS 端口(UDP)，0 禁用；默认禁用（1812 为特权端口）
 #   RADIUS_SECRET=secret      # RADIUS 共享密钥，与对接设备保持一致
 #   RADIUS_ORG=built-in       # RADIUS 请求未带组织时的默认组织
+#   SKIP_FRONTEND=0           # 非 0 跳过前端编译（仅编译后端）
+#   FORCE_FRONTEND=0          # 非 0 强制重编前端（忽略 mtime 检测）
 #   LOG_FILE=logs/casdoor.log # 服务日志落盘文件（终端与文件同时输出）
 #   RUN_USER=casdoor          # 服务运行用户，默认 casdoor
 
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 PORT="${PORT:-8000}"
 PG_USER="${PG_USER:-postgres}"
@@ -43,6 +45,8 @@ LDAPS_CERT_ID="${LDAPS_CERT_ID:-}"
 RADIUS_PORT="${RADIUS_PORT:-0}"
 RADIUS_SECRET="${RADIUS_SECRET:-secret}"
 RADIUS_ORG="${RADIUS_ORG:-built-in}"
+SKIP_FRONTEND="${SKIP_FRONTEND:-0}"
+FORCE_FRONTEND="${FORCE_FRONTEND:-0}"
 LOG_FILE="${LOG_FILE:-logs/casdoor.log}"
 RUN_USER="${RUN_USER:-casdoor}"
 BINARY="bin/casdoor-server"
@@ -141,6 +145,56 @@ _run_as_root chmod 640 "${CONF_PG}"
 if [ -f "${LOG_FILE}" ]; then
     _run_as_root chown "${RUN_USER}:${RUN_USER}" "${LOG_FILE}"
     _run_as_root chmod 644 "${LOG_FILE}"
+fi
+
+# ---------- 前端：按需编译 web/ 与 web2/（staleness 检测） ----------
+# 触发条件（任一为真即编译）:
+#   - FORCE_FRONTEND 非 0
+#   - <dir>/build/index.html 缺失
+#   - <dir>/yarn.lock 或 <dir>/src 任一文件比 <dir>/build/index.html 更新
+_need_frontend_build() {
+    local dir="$1"
+    local target="${dir}/build/index.html"
+    [ -z "${FORCE_FRONTEND}" ] || [ "${FORCE_FRONTEND}" = "0" ] || return 0
+    [ -f "${target}" ] || return 0
+    [ -f "${dir}/yarn.lock" ] && [ "${dir}/yarn.lock" -nt "${target}" ] && return 0
+    if [ -d "${dir}/src" ]; then
+        [ -z "$(find "${dir}/src" -newer "${target}" -print -quit 2>/dev/null)" ] || return 0
+    fi
+    return 1
+}
+
+if [ "${SKIP_FRONTEND}" = "0" ]; then
+    build_web=0; build_web2=0
+    _need_frontend_build "web"  && build_web=1
+    _need_frontend_build "web2" && build_web2=1
+
+    if [ $((build_web + build_web2)) -gt 0 ]; then
+        if ! command -v yarn >/dev/null 2>&1; then
+            echo "!! 前端需要编译但 yarn 未安装（请执行: npm install -g yarn）"
+            exit 1
+        fi
+        export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}"
+
+        echo ">> 前端编译: web=$([ ${build_web} -eq 1 ] && echo yes || echo skip)  web2=$([ ${build_web2} -eq 1 ] && echo yes || echo skip)"
+
+        if [ ${build_web} -eq 1 ] && [ ${build_web2} -eq 1 ]; then
+            echo "   （两份前端并行编译，日志分落 web/build.log 与 web2/build.log）"
+            (cd web  && yarn install && yarn run build > build.log 2>&1 && touch build/index.html) &
+            pid_web=$!
+            (cd web2 && yarn install && yarn run build > build.log 2>&1 && touch build/index.html) &
+            pid_web2=$!
+            if ! wait ${pid_web};  then echo "!! web/ 编译失败，详见 web/build.log";  exit 1; fi
+            if ! wait ${pid_web2}; then echo "!! web2/ 编译失败，详见 web2/build.log"; exit 1; fi
+        elif [ ${build_web} -eq 1 ]; then
+            (cd web  && yarn install && yarn run build && touch build/index.html) || { echo "!! web/ 编译失败"; exit 1; }
+        else
+            (cd web2 && yarn install && yarn run build && touch build/index.html) || { echo "!! web2/ 编译失败"; exit 1; }
+        fi
+        echo ">> 前端编译完成"
+    else
+        echo ">> 前端 build 已是最新，跳过编译（FORCE_FRONTEND=1 可强制重编）"
+    fi
 fi
 
 # 退出时清理：杀掉服务进程；停止终端日志跟踪
