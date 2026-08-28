@@ -40,3 +40,6 @@ server
 
 web/cypress/videos/
 web/cypress/screenshots/
+casdoor.tar.gz
+/__pycache__
+/out
