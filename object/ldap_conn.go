@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -505,6 +506,56 @@ func applyLdapCustomAttributes(user *User, attributes map[string]string) []strin
 	return columns
 }
 
+// ensureOrganizationApplication creates a default application for the organization
+// if it does not already have one. Casdoor's AddUser requires at least one
+// application per organization; without this, LDAP user sync would fail with
+// "The organization ... should have one application at least".
+func ensureOrganizationApplication(organization *Organization) error {
+	count, err := GetOrganizationApplicationCount(organization.Owner, organization.Name, "", "")
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	appName := fmt.Sprintf("app-%s", organization.Name)
+	application := &Application{
+		Owner:          organization.Owner,
+		Name:           appName,
+		CreatedTime:    util.GetCurrentTime(),
+		DisplayName:    fmt.Sprintf("%s Application", organization.DisplayName),
+		Organization:   organization.Name,
+		EnablePassword: true,
+		EnableSignUp:   true,
+		Providers:      []*ProviderItem{},
+	}
+
+	affected, err := AddApplication(application)
+	if err != nil {
+		return err
+	}
+	if !affected {
+		return fmt.Errorf("failed to create default application %s for organization %s", appName, organization.Name)
+	}
+
+	// Update the organization's DefaultApplication using a masked copy so that
+	// UpdateOrganization does not re-hash the already-hashed master password.
+	orgCopy := *organization
+	orgCopy.DefaultApplication = appName
+	maskedOrganization, err := GetMaskedOrganization(true, &orgCopy)
+	if err != nil {
+		return err
+	}
+
+	_, err = UpdateOrganization(util.GetId(maskedOrganization.Owner, maskedOrganization.Name), maskedOrganization, false)
+	if err != nil {
+		return err
+	}
+	organization.DefaultApplication = appName
+	return nil
+}
+
 func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string) (existUsers []LdapUser, failedUsers []LdapUser, err error) {
 	var uuids []string
 	for _, user := range syncUsers {
@@ -514,6 +565,13 @@ func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string) (existUser
 	organization, err := getOrganization("admin", owner)
 	if err != nil {
 		panic(err)
+	}
+
+	// AddUser requires the organization to have at least one application. LDAP
+	// sync should work without manual application setup, so create a default
+	// application automatically when none exists.
+	if err := ensureOrganizationApplication(organization); err != nil {
+		return nil, nil, err
 	}
 
 	ldap, err := GetLdap(ldapId)
@@ -750,7 +808,18 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 		return 0, 0, nil
 	}
 
-	// Create a map of DN to group for quick lookup
+	// Process organizational units before security groups. In Active Directory
+	// it is common for a container OU and a group inside it to share the same
+	// RDN value (e.g. OU=研发中心 and CN=研发中心). Establishing the OU
+	// hierarchy first prevents the later group entry from overwriting the
+	// parent relationship with a self-reference.
+	sort.SliceStable(ldapGroups, func(i, j int) bool {
+		isOU := func(dn string) bool { return strings.HasPrefix(strings.ToLower(dn), "ou=") }
+		return isOU(ldapGroups[i].Dn) && !isOU(ldapGroups[j].Dn)
+	})
+
+	// Create a map of DN to group for quick lookup. Build this AFTER sorting
+	// so the pointers remain stable while we recursively process parents.
 	dnToGroup := make(map[string]*LdapGroup)
 	for i := range ldapGroups {
 		dnToGroup[ldapGroups[i].Dn] = &ldapGroups[i]
@@ -774,12 +843,22 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 
 	// Process groups in hierarchical order (parents before children)
 	processedGroups := make(map[string]bool)
+	processingGroups := make(map[string]bool)
+	baseGroupName := dnToGroupName(owner, ldap.BaseDn)
+	_, baseIsGroup := dnToGroup[ldap.BaseDn]
+
 	var processGroup func(ldapGroup *LdapGroup) error
 
 	processGroup = func(ldapGroup *LdapGroup) error {
 		if processedGroups[ldapGroup.Dn] {
 			return nil
 		}
+		if processingGroups[ldapGroup.Dn] {
+			return fmt.Errorf("cycle detected in LDAP group hierarchy at %s", ldapGroup.Dn)
+		}
+
+		processingGroups[ldapGroup.Dn] = true
+		defer delete(processingGroups, ldapGroup.Dn)
 
 		// Generate group name from DN
 		groupName := dnToGroupName(owner, ldapGroup.Dn)
@@ -791,15 +870,26 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 		var parentId string
 		var isTopGroup bool
 
-		if ldapGroup.ParentDn == "" || ldapGroup.ParentDn == ldap.BaseDn {
+		if ldapGroup.Dn == ldap.BaseDn {
+			// The BaseDn entry itself is the root of the synced tree
 			isTopGroup = true
 			parentId = owner
+		} else if ldapGroup.ParentDn == "" {
+			// No parent information
+			isTopGroup = true
+			parentId = owner
+		} else if ldapGroup.ParentDn == ldap.BaseDn && baseIsGroup {
+			// Direct child of the BaseDn group
+			parentId = baseGroupName
+			isTopGroup = false
 		} else {
-			// Process parent first
+			// Process parent first (if not already processed, to avoid cycles)
 			if parentGroup, exists := dnToGroup[ldapGroup.ParentDn]; exists {
-				err := processGroup(parentGroup)
-				if err != nil {
-					return err
+				if !processedGroups[ldapGroup.ParentDn] {
+					err := processGroup(parentGroup)
+					if err != nil {
+						return err
+					}
 				}
 				parentId = dnToGroupName(owner, ldapGroup.ParentDn)
 			} else {
@@ -808,9 +898,10 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 			}
 		}
 
-		// An LDAP entry can share its parent's name (e.g. cn=X inside ou=X):
-		// linking the group to itself would break the tree hierarchy, so the
-		// existing hierarchy (set by the OU entry) must be kept instead.
+		// An LDAP entry can share its container's RDN value (e.g. CN=研发中心
+		// inside OU=研发中心). When the OU has already established the
+		// hierarchy, treating the group as its own parent would break the tree,
+		// so the container's parent relationship must be preserved.
 		selfParent := parentId == groupName && !isTopGroup
 
 		// Check if group already exists
@@ -820,10 +911,9 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 			if !selfParent {
 				existingGroup.ParentId = parentId
 				existingGroup.IsTopGroup = isTopGroup
-			} else {
-				existingGroup.ParentId = owner
-				existingGroup.IsTopGroup = true
 			}
+			// When selfParent, keep the existing parent set by the OU container
+			// instead of promoting the group to top-level.
 			existingGroup.Type = "ldap-synced"
 			existingGroup.UpdatedTime = util.GetCurrentTime()
 			// Adopt the LDAP gid without overwriting one already assigned in Casdoor.

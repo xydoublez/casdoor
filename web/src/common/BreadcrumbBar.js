@@ -17,6 +17,14 @@ import {Breadcrumb} from "antd";
 import {Link} from "react-router-dom";
 import i18next from "i18next";
 
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 const RESOURCE_LABELS = {
   "apps": "general:Apps",
   "shortcuts": "general:Shortcuts",
@@ -87,8 +95,9 @@ function buildBreadcrumbItems(uri) {
     ];
   }
 
-  const lastSegment = pathSegments[pathSegments.length - 1];
-  const lastLabelKey = RESOURCE_LABELS[lastSegment];
+  const rawLastSegment = pathSegments[pathSegments.length - 1];
+  const lastSegment = safeDecodeURIComponent(rawLastSegment);
+  const lastLabelKey = RESOURCE_LABELS[rawLastSegment];
   const lastLabel = lastLabelKey ? i18next.t(lastLabelKey) : lastSegment;
 
   return [

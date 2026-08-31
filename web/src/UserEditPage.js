@@ -168,7 +168,7 @@ class UserEditPage extends React.Component {
           applications: res.data || [],
         });
 
-        const applications = res.data;
+        const applications = res.data || [];
         if (this.state.user) {
           if (this.state.user.signupApplication === "" || applications.filter(application => application.name === this.state.user.signupApplication).length === 0) {
             if (applications.length > 0) {
@@ -320,7 +320,7 @@ class UserEditPage extends React.Component {
   }
 
   getCountryCode() {
-    return this.props.account.countryCode;
+    return this.props.account?.countryCode;
   }
 
   deleteMfa = () => {
@@ -1008,7 +1008,7 @@ class UserEditPage extends React.Component {
             {Setting.getLabel(i18next.t("user:Register type"), i18next.t("user:Register type - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.user.registerType} disabled={!this.props.account.isAdmin}
+            <Input value={this.state.user.registerType} disabled={!this.props.account?.isAdmin}
               onChange={e => {this.updateUserField("registerType", e.target.value);}} />
           </Col>
         </Row>
@@ -1020,7 +1020,7 @@ class UserEditPage extends React.Component {
             {Setting.getLabel(i18next.t("user:Register source"), i18next.t("user:Register source - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.user.registerSource} disabled={!this.props.account.isAdmin}
+            <Input value={this.state.user.registerSource} disabled={!this.props.account?.isAdmin}
               onChange={e => {this.updateUserField("registerSource", e.target.value);}} />
           </Col>
         </Row>
@@ -1063,7 +1063,7 @@ class UserEditPage extends React.Component {
               <div style={{marginBottom: 20}}>
                 {
                   (this.state.application === null || this.state.user === null) ? null : (
-                    this.state.application?.providers.filter(providerItem => Setting.isProviderVisible(providerItem)).map((providerItem) =>
+                    (this.state.application?.providers || []).filter(providerItem => Setting.isProviderVisible(providerItem)).map((providerItem) =>
                       (providerItem.provider.category === "OAuth" || providerItem.provider.category === "Web3") ? (
                         <OAuthWidget
                           key={providerItem.name}
