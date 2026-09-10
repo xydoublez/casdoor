@@ -343,10 +343,8 @@ do_upgrade() {
   # ---- 2. 预检 ----
   command -v systemctl >/dev/null || die "未找到 systemctl"
   [[ -d /run/systemd/system ]] || die "systemd 未运行"
-  # 检查升级包中是否包含可执行文件（tar 列出即可，不实际解压到磁盘）
-  if ! tar tzf "${pkg}" 2>/dev/null | grep -qiE '(^|/)casdoor$'; then
-    die "升级包中未找到 casdoor 可执行文件，请确认包内容正确"
-  fi
+  # 验证升级包完整性（仅检查 tar 能否正常列出，不做文件名猜测）
+  tar tzf "${pkg}" >/dev/null 2>&1 || die "升级包损坏或格式错误: ${pkg}"
 
   # ---- 3. 备份当前版本 ----
   local dst_bin="${INSTALL_DIR}/casdoor"
@@ -383,16 +381,35 @@ do_upgrade() {
   tar xzf "${pkg}" -C "${tmp_dir}"
 
   # 在解压结果中查找 casdoor 二进制（支持包内有一级子目录的情况）
+  # 优先级：casdoor > casdoor-server > server > 任意 ELF 可执行文件
   local new_bin
   new_bin="$(find "${tmp_dir}" -name casdoor -type f | head -1)"
+  if [[ -z "${new_bin}" ]]; then
+    new_bin="$(find "${tmp_dir}" -name casdoor-server -type f | head -1)"
+  fi
+  if [[ -z "${new_bin}" ]]; then
+    new_bin="$(find "${tmp_dir}" -name server -type f | head -1)"
+  fi
+  if [[ -z "${new_bin}" ]]; then
+    # 兜底：查找任意 ELF 可执行文件（按文件大小降序，取最大的，通常是主二进制）
+    while IFS= read -r candidate; do
+      if [[ -f "${candidate}" ]] && head -c 4 "${candidate}" 2>/dev/null | grep -q $'^\x7fELF'; then
+        new_bin="${candidate}"
+        break
+      fi
+    done < <(find "${tmp_dir}" -type f -executable -size +1M -printf '%s %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
+  fi
   if [[ -z "${new_bin}" ]]; then
     # 解压失败 → 回滚
     if [[ -n "${backup_file:-}" && -x "${backup_file}" ]]; then
       cp -p "${backup_file}" "${dst_bin}"
       systemctl start "${SERVICE_NAME}" 2>/dev/null || true
     fi
-    die "升级包中未找到 casdoor 二进制文件，已回滚"
+    warn "升级包解压内容："
+    find "${tmp_dir}" -type f | head -20 | sed 's/^/  /'
+    die "升级包中未找到可执行二进制文件，已回滚"
   fi
+  info "检测到二进制文件: ${new_bin}"
 
   # 替换二进制
   install -m 0755 "${new_bin}" "${dst_bin}"
