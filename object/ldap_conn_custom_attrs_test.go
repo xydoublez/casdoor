@@ -153,7 +153,7 @@ func TestApplyLdapCustomAttributesOverridesBuiltins(t *testing.T) {
 func TestApplyLdapCustomAttributesOnlyChangedColumns(t *testing.T) {
 	user := &User{Affiliation: "dep", Title: "job", Tag: "old"}
 	columns := applyLdapCustomAttributes(user, map[string]string{
-		"affiliation": "dep",  // unchanged -> no column
+		"affiliation": "dep", // unchanged -> no column
 		"title":       "new-job",
 		"tag":         "new-tag",
 	})

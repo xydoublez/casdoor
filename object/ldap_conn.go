@@ -513,7 +513,7 @@ func applyLdapCustomAttributes(user *User, attributes map[string]string) []strin
 // if it does not already have one. Casdoor's AddUser requires at least one
 // application per organization; without this, LDAP user sync would fail with
 // "The organization ... should have one application at least".
-func ensureOrganizationApplication(organization *Organization) error {
+func ensureOrganizationApplication(organization *Organization, lang string) error {
 	count, err := GetOrganizationApplicationCount(organization.Owner, organization.Name, "", "")
 	if err != nil {
 		return err
@@ -534,7 +534,7 @@ func ensureOrganizationApplication(organization *Organization) error {
 		Providers:      []*ProviderItem{},
 	}
 
-	affected, err := AddApplication(application)
+	affected, err := AddApplication(application, lang)
 	if err != nil {
 		return err
 	}
@@ -551,7 +551,7 @@ func ensureOrganizationApplication(organization *Organization) error {
 		return err
 	}
 
-	_, err = UpdateOrganization(util.GetId(maskedOrganization.Owner, maskedOrganization.Name), maskedOrganization, false)
+	_, err = UpdateOrganization(util.GetId(maskedOrganization.Owner, maskedOrganization.Name), maskedOrganization, false, lang)
 	if err != nil {
 		return err
 	}
@@ -573,7 +573,7 @@ func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string, lang strin
 	// AddUser requires the organization to have at least one application. LDAP
 	// sync should work without manual application setup, so create a default
 	// application automatically when none exists.
-	if err := ensureOrganizationApplication(organization); err != nil {
+	if err := ensureOrganizationApplication(organization, lang); err != nil {
 		return nil, nil, err
 	}
 

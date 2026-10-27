@@ -147,7 +147,9 @@ if [ -f "${LOG_FILE}" ]; then
     _run_as_root chmod 644 "${LOG_FILE}"
 fi
 
-# ---------- 前端：按需编译 web/ 与 web2/（staleness 检测） ----------
+# ---------- 前端：按需编译 web/（staleness 检测） ----------
+# 上游已将 web2/（shadcn/ui 版）重命名为 web/，旧的 antd 版前端移至 web-old/。
+# 后端仅服务 web/build，因此这里只编译 web/。
 # 触发条件（任一为真即编译）:
 #   - FORCE_FRONTEND 非 0
 #   - <dir>/build/index.html 缺失
@@ -165,32 +167,15 @@ _need_frontend_build() {
 }
 
 if [ "${SKIP_FRONTEND}" = "0" ]; then
-    build_web=0; build_web2=0
-    _need_frontend_build "web"  && build_web=1
-    _need_frontend_build "web2" && build_web2=1
-
-    if [ $((build_web + build_web2)) -gt 0 ]; then
+    if _need_frontend_build "web"; then
         if ! command -v yarn >/dev/null 2>&1; then
             echo "!! 前端需要编译但 yarn 未安装（请执行: npm install -g yarn）"
             exit 1
         fi
         export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}"
 
-        echo ">> 前端编译: web=$([ ${build_web} -eq 1 ] && echo yes || echo skip)  web2=$([ ${build_web2} -eq 1 ] && echo yes || echo skip)"
-
-        if [ ${build_web} -eq 1 ] && [ ${build_web2} -eq 1 ]; then
-            echo "   （两份前端并行编译，日志分落 web/build.log 与 web2/build.log）"
-            (cd web  && yarn install && yarn run build > build.log 2>&1 && touch build/index.html) &
-            pid_web=$!
-            (cd web2 && yarn install && yarn run build > build.log 2>&1 && touch build/index.html) &
-            pid_web2=$!
-            if ! wait ${pid_web};  then echo "!! web/ 编译失败，详见 web/build.log";  exit 1; fi
-            if ! wait ${pid_web2}; then echo "!! web2/ 编译失败，详见 web2/build.log"; exit 1; fi
-        elif [ ${build_web} -eq 1 ]; then
-            (cd web  && yarn install && yarn run build && touch build/index.html) || { echo "!! web/ 编译失败"; exit 1; }
-        else
-            (cd web2 && yarn install && yarn run build && touch build/index.html) || { echo "!! web2/ 编译失败"; exit 1; }
-        fi
+        echo ">> 前端编译: web"
+        (cd web && yarn install && yarn run build && touch build/index.html) || { echo "!! web/ 编译失败，详见 web/build.log"; exit 1; }
         echo ">> 前端编译完成"
     else
         echo ">> 前端 build 已是最新，跳过编译（FORCE_FRONTEND=1 可强制重编）"
