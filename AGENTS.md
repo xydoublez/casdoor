@@ -55,8 +55,8 @@ mkdir -p logs tmp
 ### 前端开发
 
 ```bash
-cd web && yarn install && yarn start      # shadcn/ui 主前端（端口 3000）
-cd web-old && yarn install && yarn start  # 旧版 Ant Design 前端
+cd web && yarn install && yarn start      # shadcn/ui 主前端（vite，端口 7001）
+cd web-old && yarn install && yarn start  # 旧版 Ant Design 前端（craco，端口 7001）
 ```
 
 ## 配置文件
