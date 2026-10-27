@@ -82,7 +82,7 @@ func getProduct(owner string, name string) (*Product, error) {
 	product := Product{Owner: owner, Name: name}
 	existed, err := ormer.Engine.Get(&product)
 	if err != nil {
-		return &product, nil
+		return nil, err
 	}
 
 	if existed {
@@ -276,7 +276,7 @@ func BuyProduct(id string, user *User, providerName, pricingName, planName, host
 		return nil, nil, err
 	}
 
-	return PayOrder(providerName, host, paymentEnv, order, lang)
+	return PayOrder(providerName, host, paymentEnv, order, nil, lang)
 }
 
 func ExtendProductWithProviders(product *Product) error {

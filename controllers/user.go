@@ -32,6 +32,10 @@ import (
 // @Success 200 {array} object.User The Response object
 // @router /get-global-users [get]
 func (c *ApiController) GetGlobalUsers() {
+	if !c.requireGlobalAdmin() {
+		return
+	}
+
 	limit := c.Ctx.Input.Query("pageSize")
 	page := c.Ctx.Input.Query("p")
 	field := c.Ctx.Input.Query("field")
@@ -230,10 +234,8 @@ func (c *ApiController) GetUser() {
 		return
 	}
 
-	requestUserId := c.GetSessionUsername()
-	isApplicationRequest := object.IsAppUser(requestUserId)
-	isAdmin := c.IsAdmin() || isApplicationRequest
-	isAdminOrSelf := c.IsAdminOrSelf(user) || isApplicationRequest
+	isAdmin := c.IsAdminOf(user)
+	isAdminOrSelf := c.IsAdminOrSelf(user)
 	user, err = object.GetMaskedUser(user, isAdminOrSelf)
 	if err != nil {
 		c.ResponseError(err.Error())
@@ -291,6 +293,11 @@ func (c *ApiController) UpdateUser() {
 		}
 		if userFromUserId == nil {
 			c.ResponseError(fmt.Sprintf(c.T("general:The user: %s doesn't exist"), userId))
+			return
+		}
+
+		if !c.IsAdminOrSelf(userFromUserId) {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
 			return
 		}
 
@@ -364,12 +371,81 @@ func (c *ApiController) UpdateUser() {
 		for _, col := range strings.Split(columnsStr, ",") {
 			columns = append(columns, util.CamelToSnakeCase(col))
 		}
+		if !isAdmin {
+			columns = object.FilterUserSelfColumns(columns)
+			if len(columns) == 0 {
+				c.ResponseError(c.T("auth:Unauthorized operation"))
+				return
+			}
+		}
+	}
+
+	isPasswordChanged := false
+	// a password_type column means the caller writes an already hashed password as it is
+	if user.Password != "" && user.Password != "***" && user.Password != oldUser.Password && !util.InSlice(columns, "password_type") {
+		if (!isAdmin && oldUser.Tag != "guest-user") || oldUser.Ldap != "" {
+			c.ResponseError(c.T("user:Please use the set-password API to change the password"))
+			return
+		}
+
+		if strings.Contains(user.Password, " ") {
+			c.ResponseError(c.T("user:New password cannot contain blank space."))
+			return
+		}
+
+		organization, err := object.GetOrganizationByUser(oldUser)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		if organization == nil {
+			c.ResponseError(fmt.Sprintf(c.T("auth:the organization: %s is not found"), oldUser.Owner))
+			return
+		}
+
+		if msg := object.CheckPasswordComplexityByOrg(organization, user.Password, c.GetAcceptLanguage()); msg != "" {
+			c.ResponseError(msg)
+			return
+		}
+
+		msg, err := object.CheckPasswordReuse(oldUser, user.Password, organization, c.GetAcceptLanguage())
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		if msg != "" {
+			c.ResponseError(msg)
+			return
+		}
+
+		err = oldUser.AddPasswordHistory(organization)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+
+		user.UpdateUserPassword(organization)
+		user.LastChangePasswordTime = util.GetCurrentTime()
+		user.NeedUpdatePassword = isAdmin && user.NeedUpdatePassword && (util.InSlice(columns, "need_update_password") || !oldUser.NeedUpdatePassword)
+		if len(columns) == 0 {
+			columns = object.GetDefaultUserUpdateColumns(isAdmin)
+		}
+		columns = append(columns, "password", "password_salt", "password_type", "last_change_password_time", "need_update_password")
+		isPasswordChanged = true
 	}
 
 	affected, err := object.UpdateUser(id, &user, columns, isAdmin)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
+	}
+
+	if affected && isPasswordChanged && oldUser.Tag != "guest-user" {
+		_, err = object.ExpireTokenByUser(oldUser.Owner, oldUser.Name)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
 	}
 
 	if affected {
@@ -648,9 +724,13 @@ func (c *ApiController) SetPassword() {
 		return
 	}
 
-	// Check if the new password is the same as the current password
-	if !object.CheckPasswordNotSameAsCurrent(targetUser, newPassword, organization) {
-		c.ResponseError(c.T("user:The new password must be different from your current password"))
+	msg, err = object.CheckPasswordReuse(targetUser, newPassword, organization, c.GetAcceptLanguage())
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if msg != "" {
+		c.ResponseError(msg)
 		return
 	}
 
@@ -676,6 +756,14 @@ func (c *ApiController) SetPassword() {
 		c.SetSession("verifiedUserId", "")
 	}
 
+	if user.Ldap == "" {
+		err = targetUser.AddPasswordHistory(organization)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+	}
+
 	targetUser.Password = newPassword
 	targetUser.UpdateUserPassword(organization)
 	targetUser.NeedUpdatePassword = false
@@ -693,6 +781,63 @@ func (c *ApiController) SetPassword() {
 
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+
+	_, err = object.ExpireTokenByUser(targetUser.Owner, targetUser.Name)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
+	c.ResponseOk()
+}
+
+// GetInitAdminStatus
+// @Title GetInitAdminStatus
+// @Tag Account API
+// @Description whether built-in/admin is waiting for its first password on the welcome page
+// @Success 200 {object} controllers.Response The Response object
+// @router /get-init-admin-status [get]
+func (c *ApiController) GetInitAdminStatus() {
+	isPending, err := object.IsInitAdminPending()
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
+	c.ResponseOk(isPending)
+}
+
+// InitAdminPassword
+// @Title InitAdminPassword
+// @Tag Account API
+// @Description set the first password of built-in/admin on the welcome page
+// @Param   password     formData    string  true        "The password"
+// @Success 200 {object} controllers.Response The Response object
+// @router /init-admin-password [post]
+func (c *ApiController) InitAdminPassword() {
+	password := c.Ctx.Request.Form.Get("password")
+
+	organization, err := object.GetOrganization(util.GetId("admin", "built-in"))
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if organization != nil && organization.PasswordObfuscatorType != "" && organization.PasswordObfuscatorType != "Plain" {
+		deobfuscatedPassword, deobfuscateErr := util.GetUnobfuscatedPassword(organization.PasswordObfuscatorType, organization.PasswordObfuscatorKey, password)
+		if deobfuscateErr == nil {
+			password = deobfuscatedPassword
+		}
+	}
+
+	isSet, err := object.SetInitAdminPassword(password, c.GetAcceptLanguage())
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if !isSet {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
 		return
 	}
 
@@ -783,9 +928,14 @@ func (c *ApiController) RemoveUserFromGroup() {
 
 	organization, err := object.GetOrganization(util.GetId("admin", owner))
 	if err != nil {
+		c.ResponseError(err.Error())
 		return
 	}
-	item := object.GetAccountItemByName("Groups", organization)
+	if organization == nil {
+		c.ResponseError(fmt.Sprintf(c.T("auth:The organization: %s does not exist"), owner))
+		return
+	}
+	item := object.GetAccountItemForUpdate("Groups", organization)
 	res, msg := object.CheckAccountItemModifyRule(item, c.IsAdmin(), c.GetAcceptLanguage())
 	if !res {
 		c.ResponseError(msg)
@@ -967,6 +1117,11 @@ func (c *ApiController) VerifyIdentification() {
 
 		if provider.Category != "ID Verification" {
 			c.ResponseError(c.T("provider:Provider is not an ID Verification provider"))
+			return
+		}
+
+		if !isProviderVisibleToUser(provider, user) {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
 			return
 		}
 	}

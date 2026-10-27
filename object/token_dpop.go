@@ -29,6 +29,8 @@ import (
 
 const dpopMaxAgeSeconds = 300
 
+var DPoPSigningAlgs = []string{"RS256", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"}
+
 // DPoPProofClaims represents the payload claims of a DPoP proof JWT (RFC 9449).
 type DPoPProofClaims struct {
 	Jti string `json:"jti"`
@@ -154,4 +156,22 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 func GetDPoPHtu(host, path string) string {
 	_, originBackend := getOriginFromHost(host)
 	return originBackend + path
+}
+
+func getRefreshDPoPJkt(token *Token, dpopProof string, host string, path string) (string, *TokenError) {
+	if dpopProof == "" {
+		if token.DPoPJkt != "" {
+			return "", &TokenError{Error: "invalid_dpop_proof", ErrorDescription: "a DPoP proof is required to refresh a DPoP-bound token"}
+		}
+		return "", nil
+	}
+
+	jkt, err := ValidateDPoPProof(dpopProof, "POST", GetDPoPHtu(host, path), "")
+	if err != nil {
+		return "", &TokenError{Error: "invalid_dpop_proof", ErrorDescription: err.Error()}
+	}
+	if token.DPoPJkt != "" && jkt != token.DPoPJkt {
+		return "", &TokenError{Error: "invalid_dpop_proof", ErrorDescription: "the DPoP proof key does not match the key the refresh token is bound to"}
+	}
+	return jkt, nil
 }

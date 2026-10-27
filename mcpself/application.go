@@ -68,7 +68,19 @@ func (c *McpController) handleAddApplicationTool(id interface{}, args AddApplica
 		return
 	}
 
-	affected, err := object.AddApplication(&args.Application)
+	if !c.isOrganizationAllowed(args.Application.Organization) {
+		c.SendToolErrorResult(id, "unauthorized operation")
+		return
+	}
+
+	if !c.IsGlobalAdmin() {
+		if err = object.CheckApplicationCustomHtml(&args.Application, nil); err != nil {
+			c.SendToolErrorResult(id, err.Error())
+			return
+		}
+	}
+
+	affected, err := object.AddApplication(&args.Application, c.GetAcceptLanguage())
 	if err != nil {
 		c.SendToolErrorResult(id, err.Error())
 		return

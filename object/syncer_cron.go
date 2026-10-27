@@ -15,6 +15,7 @@
 package object
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/robfig/cron/v3"
@@ -51,35 +52,33 @@ func addSyncerJob(syncer *Syncer) error {
 		return nil
 	}
 
-	err := syncer.initAdapter()
-	if err != nil {
-		return err
-	}
-
-	err = syncer.syncUsers()
-	if err != nil {
-		return err
-	}
-
-	// Sync groups as well
-	err = syncer.syncGroups()
-	if err != nil {
-		// Log error but don't fail the entire sync
-		fmt.Printf("Warning: syncGroups() error: %s\n", err.Error())
-	}
-
 	schedule := fmt.Sprintf("@every %ds", syncer.SyncInterval)
 	cron := getCronMap(syncer.Name)
-	_, err = cron.AddFunc(schedule, func() {
-		syncer.syncUsersNoError()
-		syncer.syncGroupsNoError()
+	_, err := cron.AddFunc(schedule, func() {
+		runSyncerNoError(syncer)
 	})
 	if err != nil {
 		return err
 	}
 
+	// A failed first run must not stop the job, otherwise the syncer stays idle until the next restart
+	err = RunSyncer(syncer)
+	if errors.Is(err, errSyncerRunning) {
+		err = nil
+	} else if err != nil {
+		recordSyncerError(syncer, err)
+	}
+
 	cron.Start()
-	return nil
+	return err
+}
+
+func runSyncerNoError(syncer *Syncer) {
+	err := RunSyncer(syncer)
+	if err != nil && !errors.Is(err, errSyncerRunning) {
+		recordSyncerError(syncer, err)
+		fmt.Printf("runSyncerNoError() error: %s\n", err.Error())
+	}
 }
 
 func deleteSyncerJob(syncer *Syncer) {

@@ -15,6 +15,7 @@
 package object
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -38,6 +39,11 @@ func (syncer *Syncer) getCasdoorColumns() []string {
 	for _, tableColumn := range syncer.TableColumns {
 		if tableColumn.CasdoorName != "Id" {
 			v := util.CamelToSnakeCase(tableColumn.CasdoorName)
+			// CasdoorName is org-admin controlled and these values become column names in
+			// an UPDATE SET clause, so drop anything that is not a plain SQL identifier.
+			if !util.FilterSQLIdentifier(v) {
+				continue
+			}
 			res = append(res, v)
 		}
 	}
@@ -52,6 +58,13 @@ func (syncer *Syncer) updateUser(user *OriginalUser) (bool, error) {
 func (syncer *Syncer) updateUserForOriginalFields(user *User, key string) (bool, error) {
 	var err error
 	oldUser := User{}
+
+	// key is the snake_cased CasdoorName of the syncer's key column, which an org admin
+	// controls, and it is concatenated into the WHERE clause below, so reject any value
+	// that is not a plain SQL identifier to keep it from injecting SQL into Casdoor's DB.
+	if !util.FilterSQLIdentifier(key) {
+		return false, fmt.Errorf("object.updateUserForOriginalFields() error: invalid key field: %s", key)
+	}
 
 	existed, err := ormer.Engine.Where(key+" = ? and owner = ?", syncer.getUserValue(user, key), user.Owner).Get(&oldUser)
 	if err != nil {
@@ -124,13 +137,15 @@ func (syncer *Syncer) initAdapter() error {
 func RunSyncUsersJob() {
 	syncers, err := GetSyncers("admin")
 	if err != nil {
-		panic(err)
+		fmt.Printf("RunSyncUsersJob() error: %s\n", err.Error())
+		return
 	}
 
+	// A failing syncer must not stop the others; its error is already in its error text
 	for _, syncer := range syncers {
 		err = addSyncerJob(syncer)
 		if err != nil {
-			panic(err)
+			fmt.Printf("RunSyncUsersJob() failed to start syncer [%s]: %s\n", syncer.GetId(), err.Error())
 		}
 	}
 

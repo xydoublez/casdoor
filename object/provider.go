@@ -17,7 +17,6 @@ package object
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -85,6 +84,8 @@ type Provider struct {
 	EnableProxy bool   `json:"enableProxy"`
 	EnablePkce  bool   `json:"enablePkce"`
 
+	RequireMessageAuthenticator bool `json:"requireMessageAuthenticator"`
+
 	State string `xorm:"varchar(100)" json:"state"`
 }
 
@@ -107,7 +108,57 @@ func GetMaskedProvider(provider *Provider, isMaskEnabled bool) *Provider {
 		}
 	}
 
+	provider.HttpHeaders = getMaskedHttpHeaders(provider.HttpHeaders)
+
+	if isProviderContentSecret(provider) && provider.Content != "" {
+		provider.Content = "***"
+	}
+	if isProviderMetadataSecret(provider) && provider.Metadata != "" {
+		provider.Metadata = "***"
+	}
+
 	return provider
+}
+
+func isProviderContentSecret(provider *Provider) bool {
+	return provider.Type == "WeChat"
+}
+
+func isProviderMetadataSecret(provider *Provider) bool {
+	return provider.Type == "Google Chat"
+}
+
+func getMaskedHttpHeaders(headers map[string]string) map[string]string {
+	if headers == nil {
+		return nil
+	}
+
+	res := map[string]string{}
+	for key, value := range headers {
+		if value != "" {
+			value = "***"
+		}
+		res[key] = value
+	}
+	return res
+}
+
+func IsHttpHeadersMasked(headers map[string]string) bool {
+	for _, value := range headers {
+		if value == "***" {
+			return true
+		}
+	}
+	return false
+}
+
+func RestoreMaskedHttpHeaders(headers map[string]string, oldHeaders map[string]string) map[string]string {
+	for key, value := range headers {
+		if value == "***" {
+			headers[key] = oldHeaders[key]
+		}
+	}
+	return headers
 }
 
 func GetMaskedProviders(providers []*Provider, isMaskEnabled bool) []*Provider {
@@ -121,8 +172,15 @@ func GetMaskedProviders(providers []*Provider, isMaskEnabled bool) []*Provider {
 	return providers
 }
 
+func getProviderFilterField(field string) string {
+	if strings.EqualFold(field, "content") || strings.EqualFold(field, "metadata") {
+		return ""
+	}
+	return field
+}
+
 func GetProviderCount(owner, field, value string) (int64, error) {
-	session := GetSession("", -1, -1, field, value, "", "")
+	session := GetSession("", -1, -1, getProviderFilterField(field), value, "", "")
 	return session.Where("owner = ? or owner = ? ", "admin", owner).Count(&Provider{})
 }
 
@@ -163,7 +221,7 @@ func GetGlobalProviders() ([]*Provider, error) {
 
 func GetPaginationProviders(owner string, offset, limit int, field, value, sortField, sortOrder string) ([]*Provider, error) {
 	providers := []*Provider{}
-	session := GetSession("", offset, limit, field, value, sortField, sortOrder)
+	session := GetSession("", offset, limit, getProviderFilterField(field), value, sortField, sortOrder)
 	err := session.Where("owner = ? or owner = ? ", "admin", owner).Find(&providers)
 	if err != nil {
 		return providers, err
@@ -224,11 +282,14 @@ func UpdateProvider(id string, provider *Provider) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if p, err := getProvider(owner, name); err != nil {
+	p, err := getProvider(owner, name)
+	if err != nil {
 		return false, err
 	} else if p == nil {
 		return false, nil
 	}
+
+	provider.HttpHeaders = RestoreMaskedHttpHeaders(provider.HttpHeaders, p.HttpHeaders)
 
 	if provider.EmailRegex != "" {
 		_, err := regexp.Compile(provider.EmailRegex)
@@ -249,6 +310,10 @@ func UpdateProvider(id string, provider *Provider) (bool, error) {
 		return false, err
 	}
 
+	if err := validateAuditProvider(provider); err != nil {
+		return false, err
+	}
+
 	if name != provider.Name {
 		err := providerChangeTrigger(owner, name, provider.Name)
 		if err != nil {
@@ -263,6 +328,12 @@ func UpdateProvider(id string, provider *Provider) (bool, error) {
 	if provider.ClientSecret2 == "***" {
 		session = session.Omit("client_secret2")
 	}
+	if provider.Content == "***" && isProviderContentSecret(provider) {
+		session = session.Omit("content")
+	}
+	if provider.Metadata == "***" && isProviderMetadataSecret(provider) {
+		session = session.Omit("metadata")
+	}
 
 	if provider.Type == "Tencent Cloud COS" {
 		provider.Endpoint = util.GetEndPoint(provider.Endpoint)
@@ -276,6 +347,7 @@ func UpdateProvider(id string, provider *Provider) (bool, error) {
 
 	if affected != 0 {
 		refreshLogProviderRuntime(util.GetId(owner, name), provider)
+		stopAuditProvider(util.GetId(owner, name))
 	}
 
 	return affected != 0, nil
@@ -306,6 +378,10 @@ func AddProvider(provider *Provider) (bool, error) {
 		return false, err
 	}
 
+	if err := validateAuditProvider(provider); err != nil {
+		return false, err
+	}
+
 	affected, err := ormer.Engine.Insert(provider)
 	if err != nil {
 		return false, err
@@ -326,6 +402,7 @@ func DeleteProvider(provider *Provider) (bool, error) {
 
 	if affected != 0 {
 		stopLogProviderRuntime(provider.GetId())
+		stopAuditProvider(provider.GetId())
 	}
 
 	return affected != 0, nil
@@ -335,7 +412,7 @@ func GetPaymentProvider(p *Provider) (pp.PaymentProvider, error) {
 	cert := &Cert{}
 	if p.Cert != "" {
 		var err error
-		cert, err = GetCert(util.GetId(p.Owner, p.Cert))
+		cert, err = GetCertEx(util.GetId(p.Owner, p.Cert))
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +431,7 @@ func GetPaymentProvider(p *Provider) (pp.PaymentProvider, error) {
 	} else if typ == "Alipay" {
 		if p.Metadata != "" {
 			// alipay provider store rootCert's name in metadata
-			rootCert, err := GetCert(util.GetId(p.Owner, p.Metadata))
+			rootCert, err := GetCertEx(util.GetId(p.Owner, p.Metadata))
 			if err != nil {
 				return nil, err
 			}
@@ -372,7 +449,7 @@ func GetPaymentProvider(p *Provider) (pp.PaymentProvider, error) {
 	} else if typ == "GC" {
 		return pp.NewGcPaymentProvider(p.ClientId, p.ClientSecret, p.Host), nil
 	} else if typ == "WeChat Pay" {
-		pp, err := pp.NewWechatPaymentProvider(p.ClientId, p.ClientSecret, p.ClientId2, cert.Certificate, cert.PrivateKey)
+		pp, err := pp.NewWechatPaymentProvider(p.ClientId, p.ClientSecret, p.ClientId2, cert.Certificate, cert.PrivateKey, p.ClientSecret2, p.Content)
 		if err != nil {
 			return nil, err
 		}
@@ -470,21 +547,12 @@ func GetCaptchaProviderByApplication(applicationId, isCurrentProvider, lang stri
 	if application == nil || len(application.Providers) == 0 {
 		return nil, errors.New(i18n.Translate(lang, "provider:Invalid application id"))
 	}
-	for _, provider := range application.Providers {
-		if provider.Provider == nil {
-			continue
-		}
-		if provider.Provider.Category == "Captcha" {
-			// For CAPTCHA providers, "None" means disabled (don't show CAPTCHA at all)
-			// This is different from SMS/Email providers where "None" is treated as "All"
-			// CAPTCHA Rule options are: "None" (disabled), "Dynamic", "Always", "Internet-Only"
-			if provider.Rule == "None" || provider.Rule == "" {
-				return nil, nil
-			}
-			return GetCaptchaProviderByOwnerName(util.GetId(provider.Provider.Owner, provider.Provider.Name), lang)
-		}
+
+	providerItem := GetCaptchaProviderItem(application)
+	if providerItem == nil {
+		return nil, nil
 	}
-	return nil, nil
+	return GetCaptchaProviderByOwnerName(util.GetId(providerItem.Provider.Owner, providerItem.Provider.Name), lang)
 }
 
 func GetFaceIdProviderByOwnerName(applicationId, lang string) (*Provider, error) {
@@ -578,28 +646,40 @@ func providerChangeTrigger(owner string, oldName string, newName string) error {
 		return err
 	}
 
+	// global ("admin") providers are visible to every organization, others only to their own
 	var applications []*Application
-	err = ormer.Engine.Find(&applications)
+	if owner == "admin" {
+		err = ormer.Engine.Find(&applications)
+	} else {
+		err = ormer.Engine.Where("organization=?", owner).Find(&applications)
+	}
 	if err != nil {
 		return err
 	}
 	for i := 0; i < len(applications); i++ {
+		changed := false
 		providers := applications[i].Providers
 		for j := 0; j < len(providers); j++ {
 			if providers[j].Name == oldName {
 				providers[j].Name = newName
+				changed = true
 			}
 		}
+		if !changed {
+			continue
+		}
 		applications[i].Providers = providers
-		_, err = session.Where("name=?", applications[i].Name).Update(applications[i])
+		_, err = session.Where("owner=?", applications[i].Owner).And("name=?", applications[i].Name).Cols("providers").Update(applications[i])
 		if err != nil {
 			return err
 		}
 	}
 
-	resource := new(Resource)
-	resource.Provider = newName
-	_, err = session.Where("provider=?", oldName).Update(resource)
+	resourceSession := session.Where("provider=?", oldName)
+	if owner != "admin" {
+		resourceSession = resourceSession.And("owner=?", owner)
+	}
+	_, err = resourceSession.Cols("provider").Update(&Resource{Provider: newName})
 	if err != nil {
 		return err
 	}
@@ -634,10 +714,10 @@ func FromProviderToIdpInfo(ctx *context.Context, provider *Provider) (*idp.Provi
 			providerInfo.ClientId = provider.ClientId2
 			providerInfo.ClientSecret = provider.ClientSecret2
 		}
-	} else if provider.Type == "ADFS" || provider.Type == "AzureAD" || provider.Type == "AzureADB2C" || provider.Type == "Casdoor" || provider.Type == "Okta" {
+	} else if provider.Type == "ADFS" || provider.Type == "AzureAD" || provider.Type == "AzureADB2C" || provider.Type == "Casdoor" || provider.Type == "Okta" || provider.Type == "OIDC" {
 		providerInfo.HostUrl = provider.Domain
 	} else if provider.Type == "Alipay" && provider.Cert != "" {
-		cert, err := GetCert(util.GetId(provider.Owner, provider.Cert))
+		cert, err := GetCertEx(util.GetId(provider.Owner, provider.Cert))
 		if err != nil {
 			return nil, fmt.Errorf("failed to load certificate for Alipay provider %s: %w", provider.Name, err)
 		}
@@ -647,7 +727,7 @@ func FromProviderToIdpInfo(ctx *context.Context, provider *Provider) (*idp.Provi
 		providerInfo.ClientSecret = cert.PrivateKey
 		providerInfo.AppCertificate = cert.Certificate
 		if provider.Metadata != "" {
-			rootCert, err := GetCert(util.GetId(provider.Owner, provider.Metadata))
+			rootCert, err := GetCertEx(util.GetId(provider.Owner, provider.Metadata))
 			if err != nil {
 				return nil, fmt.Errorf("failed to load root certificate for Alipay provider %s: %w", provider.Name, err)
 			}
@@ -730,7 +810,7 @@ func InvokeCustomProviderLogout(application *Application, accessToken string) {
 
 	for _, providerItem := range application.Providers {
 		provider := providerItem.Provider
-		if provider == nil || provider.Category != "OAuth" || !strings.HasPrefix(provider.Type, "Custom") {
+		if provider == nil || provider.Category != "OAuth" || !IsCustomOAuthProvider(provider.Type) {
 			continue
 		}
 		if provider.CustomLogoutUrl == "" {
@@ -749,7 +829,7 @@ func callProviderLogoutUrl(provider *Provider, accessToken string) {
 	params.Set("client_id", provider.ClientId)
 	params.Set("client_secret", provider.ClientSecret)
 
-	resp, err := http.PostForm(provider.CustomLogoutUrl, params)
+	resp, err := getProviderHttpClient(provider).PostForm(provider.CustomLogoutUrl, params)
 	if err != nil {
 		util.LogWarning(nil, "InvokeCustomProviderLogout: failed to call logout URL %s for provider %s: %v", provider.CustomLogoutUrl, provider.Name, err)
 		return

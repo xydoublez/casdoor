@@ -19,10 +19,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/object"
 	"github.com/casdoor/casdoor/util"
 	"github.com/elimity-com/scim"
 	"github.com/elimity-com/scim/errors"
+	"github.com/xorm-io/builder"
 )
 
 const GroupExtensionKey = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:Group"
@@ -31,12 +33,16 @@ type GroupResourceHandler struct{}
 
 func (h GroupResourceHandler) Create(r *http.Request, attrs scim.ResourceAttributes) (scim.Resource, error) {
 	resource := &scim.Resource{Attributes: attrs}
-	err := addScimGroup(resource)
+	err := addScimGroup(r, resource)
 	return *resource, err
 }
 
 func (h GroupResourceHandler) Get(r *http.Request, id string) (scim.Resource, error) {
-	resource, err := getScimGroup(id)
+	group, err := getScopedGroup(r, id)
+	if err != nil {
+		return scim.Resource{}, err
+	}
+	resource, err := getScimGroup(group.GetId())
 	if err != nil {
 		return scim.Resource{}, err
 	}
@@ -47,12 +53,9 @@ func (h GroupResourceHandler) Get(r *http.Request, id string) (scim.Resource, er
 }
 
 func (h GroupResourceHandler) Delete(r *http.Request, id string) error {
-	group, err := object.GetGroup(id)
+	group, err := getScopedGroup(r, id)
 	if err != nil {
 		return err
-	}
-	if group == nil {
-		return errors.ScimErrorResourceNotFound(id)
 	}
 	if err := clearGroupMembers(id); err != nil {
 		return err
@@ -62,16 +65,29 @@ func (h GroupResourceHandler) Delete(r *http.Request, id string) error {
 }
 
 func (h GroupResourceHandler) GetAll(r *http.Request, params scim.ListRequestParams) (scim.Page, error) {
-	if params.Count == 0 {
-		count, err := object.GetGroupCount("", "", "")
+	organization, err := getOrganization(r)
+	if err != nil {
+		return scim.Page{}, err
+	}
+
+	cond := builder.NewCond()
+	if params.Filter != nil {
+		cond, err = filterToCond(params.Filter, nil, groupFilterCond)
 		if err != nil {
 			return scim.Page{}, err
 		}
+	}
+
+	count, err := object.GetGroupCountWithFilter(organization, cond)
+	if err != nil {
+		return scim.Page{}, err
+	}
+	if params.Count == 0 {
 		return scim.Page{TotalResults: int(count)}, nil
 	}
 
 	// startIndex is 1-based
-	groups, err := object.GetPaginationGroups("", params.StartIndex-1, params.Count, "", "", "", "")
+	groups, err := object.GetPaginationGroupsWithFilter(organization, params.StartIndex-1, params.Count, cond)
 	if err != nil {
 		return scim.Page{}, err
 	}
@@ -87,39 +103,41 @@ func (h GroupResourceHandler) GetAll(r *http.Request, params scim.ListRequestPar
 		}
 	}
 
-	totalCount, err := object.GetGroupCount("", "", "")
-	if err != nil {
-		return scim.Page{}, err
-	}
-
 	return scim.Page{
-		TotalResults: int(totalCount),
+		TotalResults: int(count),
 		Resources:    resources,
 	}, nil
 }
 
 func (h GroupResourceHandler) Patch(r *http.Request, id string, operations []scim.PatchOperation) (scim.Resource, error) {
-	group, err := object.GetGroup(id)
+	group, err := getScopedGroup(r, id)
 	if err != nil {
 		return scim.Resource{}, err
 	}
-	if group == nil {
-		return scim.Resource{}, errors.ScimErrorResourceNotFound(id)
-	}
-	return updateScimGroupByPatch(id, group, operations)
+	return updateScimGroupByPatch(r, id, group, operations)
 }
 
 func (h GroupResourceHandler) Replace(r *http.Request, id string, attrs scim.ResourceAttributes) (scim.Resource, error) {
-	group, err := object.GetGroup(id)
+	group, err := getScopedGroup(r, id)
 	if err != nil {
 		return scim.Resource{}, err
 	}
-	if group == nil {
-		return scim.Resource{}, errors.ScimErrorResourceNotFound(id)
-	}
 	resource := &scim.Resource{Attributes: attrs}
-	err = updateScimGroup(id, group, resource)
+	err = updateScimGroup(r, id, group, resource)
 	return *resource, err
+}
+
+// getScopedGroup returns the group of the SCIM id, as not found when it is outside the
+// organization the request is limited to.
+func getScopedGroup(r *http.Request, id string) (*object.Group, error) {
+	group, err := object.GetGroup(id)
+	if err != nil {
+		return nil, err
+	}
+	if group == nil || !isOrganizationAllowed(r, group.Owner) {
+		return nil, errors.ScimErrorResourceNotFound(id)
+	}
+	return group, nil
 }
 
 func getScimGroup(id string) (*scim.Resource, error) {
@@ -137,9 +155,12 @@ func getScimGroup(id string) (*scim.Resource, error) {
 	return group2resource(group, users), nil
 }
 
-func addScimGroup(r *scim.Resource) error {
+func addScimGroup(req *http.Request, r *scim.Resource) error {
 	newGroup, err := resource2group(r.Attributes)
 	if err != nil {
+		return err
+	}
+	if err = checkOrganization(req, newGroup.Owner); err != nil {
 		return err
 	}
 
@@ -183,7 +204,7 @@ func addScimGroup(r *scim.Resource) error {
 	return nil
 }
 
-func updateScimGroup(id string, oldGroup *object.Group, r *scim.Resource) error {
+func updateScimGroup(req *http.Request, id string, oldGroup *object.Group, r *scim.Resource) error {
 	newGroup, err := resource2group(r.Attributes)
 	if err != nil {
 		return err
@@ -192,7 +213,7 @@ func updateScimGroup(id string, oldGroup *object.Group, r *scim.Resource) error 
 	newGroup.Name = oldGroup.Name
 	newGroup.UpdatedTime = util.GetCurrentTime()
 
-	_, err = object.UpdateGroup(id, newGroup, true, "en")
+	_, err = object.UpdateGroup(id, newGroup, true, conf.GetAcceptLanguage(req.Header.Get("Accept-Language")))
 	if err != nil {
 		return err
 	}
@@ -222,7 +243,7 @@ func updateScimGroup(id string, oldGroup *object.Group, r *scim.Resource) error 
 	return nil
 }
 
-func updateScimGroupByPatch(id string, group *object.Group, ops []scim.PatchOperation) (r scim.Resource, err error) {
+func updateScimGroupByPatch(req *http.Request, id string, group *object.Group, ops []scim.PatchOperation) (r scim.Resource, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("invalid patch op value: %v", rec)
@@ -277,8 +298,12 @@ func updateScimGroupByPatch(id string, group *object.Group, ops []scim.PatchOper
 		}
 	}
 
+	if err = checkOrganization(req, group.Owner); err != nil {
+		return scim.Resource{}, err
+	}
+
 	group.UpdatedTime = util.GetCurrentTime()
-	_, err = object.UpdateGroup(id, group, true, "en")
+	_, err = object.UpdateGroup(id, group, true, conf.GetAcceptLanguage(req.Header.Get("Accept-Language")))
 	if err != nil {
 		return scim.Resource{}, err
 	}
@@ -361,10 +386,24 @@ func extractMemberIds(raw interface{}) []string {
 	return ids
 }
 
+// getGroupMember returns the user of the SCIM id when it may join the group, i.e. it
+// belongs to the group's organization.
+func getGroupMember(groupId string, userId string) (*object.User, error) {
+	user, err := object.GetUserByUserIdOnly(userId)
+	if err != nil || user == nil {
+		return nil, err
+	}
+	groupOwner, _ := util.GetOwnerAndNameFromIdNoCheck(groupId)
+	if user.Owner != groupOwner {
+		return nil, nil
+	}
+	return user, nil
+}
+
 // addGroupMembers adds users (identified by SCIM/Casdoor user ID) to the group.
 func addGroupMembers(groupId string, userIds []string) error {
 	for _, userId := range userIds {
-		user, err := object.GetUserByUserIdOnly(userId)
+		user, err := getGroupMember(groupId, userId)
 		if err != nil || user == nil {
 			continue
 		}
@@ -391,7 +430,7 @@ func setGroupMembers(groupId string, newUserIds []string, currentUserIds []strin
 
 	for id := range newSet {
 		if !currentSet[id] {
-			user, err := object.GetUserByUserIdOnly(id)
+			user, err := getGroupMember(groupId, id)
 			if err != nil || user == nil {
 				continue
 			}

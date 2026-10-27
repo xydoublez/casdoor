@@ -15,7 +15,9 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/casdoor/casdoor/object"
 )
@@ -132,6 +134,13 @@ func (c *ApiController) GrantConsent() {
 		return
 	}
 
+	// consent is asked by the authorization code and hybrid flows, both return a code
+	responseType, ok := object.ParseResponseType(request.ResponseType)
+	if !ok || !responseType.Code {
+		c.ResponseError(fmt.Sprintf(c.T("token:Grant_type: %s is not supported in this application"), request.ResponseType))
+		return
+	}
+
 	// Validate application by clientId
 	application, err := object.GetApplicationByClientId(request.ClientId)
 	if err != nil {
@@ -139,7 +148,7 @@ func (c *ApiController) GrantConsent() {
 		return
 	}
 	if application == nil {
-		c.ResponseError(c.T("general:Invalid client_id"))
+		c.ResponseError(c.T("token:Invalid client_id"))
 		return
 	}
 
@@ -160,40 +169,21 @@ func (c *ApiController) GrantConsent() {
 		return
 	}
 
-	appId := application.GetId()
-	found := false
-	// Insert new scope into existing applicationScopes
-	for i, record := range userObj.ApplicationScopes {
-		if record.Application == appId {
-			existing := make(map[string]bool)
-			for _, s := range userObj.ApplicationScopes[i].GrantedScopes {
-				existing[s] = true
-			}
-			for _, s := range request.Scopes {
-				if !existing[s] {
-					userObj.ApplicationScopes[i].GrantedScopes = append(userObj.ApplicationScopes[i].GrantedScopes, s)
-					existing[s] = true
-				}
-			}
-			found = true
-			break
-		}
+	if !c.checkSigninCompleted(userObj) || !c.checkApplicationSignin(application, userObj) || !c.checkUserOfApplication(userObj, application) {
+		return
 	}
-	// create a new applicationScopes if not found
-	if !found {
-		uniqueScopes := []string{}
-		existing := make(map[string]bool)
-		for _, s := range request.Scopes {
-			if !existing[s] {
-				uniqueScopes = append(uniqueScopes, s)
-				existing[s] = true
-			}
-		}
-		userObj.ApplicationScopes = append(userObj.ApplicationScopes, object.ConsentRecord{
-			Application:   appId,
-			GrantedScopes: uniqueScopes,
-		})
+
+	grantedScopes, ok := object.GetConsentGrantedScopes(request.Scope, request.Scopes)
+	if !ok {
+		c.ResponseError(c.T("token:Invalid scope"))
+		return
 	}
+	if len(grantedScopes) == 0 {
+		c.ResponseError(c.T("general:Granted scopes cannot be empty"))
+		return
+	}
+
+	object.UpdateConsentRecord(userObj, application, request.Scope, grantedScopes)
 
 	_, err = object.UpdateUser(userObj.GetId(), userObj, []string{"application_scopes"}, false)
 	if err != nil {
@@ -214,6 +204,8 @@ func (c *ApiController) GrantConsent() {
 		request.Nonce,
 		request.Challenge,
 		request.Resource,
+		c.Ctx.Input.CruSession.SessionID(context.Background()),
+		c.getSessionAuthTime(),
 		c.Ctx.Request.Host,
 		c.GetAcceptLanguage(),
 	)
@@ -222,5 +214,6 @@ func (c *ApiController) GrantConsent() {
 		return
 	}
 
-	c.ResponseOk(code.Code)
+	c.Data["json"] = codeToResponseWithTokens(code, responseType)
+	c.ServeJSON()
 }

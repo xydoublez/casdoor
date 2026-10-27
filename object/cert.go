@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/casdoor/casdoor/certificate"
+	"github.com/casdoor/casdoor/i18n"
 	"github.com/casdoor/casdoor/util"
 	"github.com/xorm-io/core"
 	"golang.org/x/net/publicsuffix"
@@ -59,17 +60,6 @@ func GetMaskedCert(cert *Cert) *Cert {
 		cert.AccessSecret = "***"
 	}
 	return cert
-}
-
-func GetMaskedCerts(certs []*Cert, err error) ([]*Cert, error) {
-	if err != nil {
-		return nil, err
-	}
-
-	for _, cert := range certs {
-		cert = GetMaskedCert(cert)
-	}
-	return certs, nil
 }
 
 func GetCertCount(owner, field, value string) (int64, error) {
@@ -146,25 +136,15 @@ func getCert(owner string, name string) (*Cert, error) {
 	}
 }
 
-func getCertByName(name string) (*Cert, error) {
-	if name == "" {
-		return nil, nil
-	}
-
-	cert := Cert{Name: name}
-	existed, err := ormer.Engine.Get(&cert)
+func GetCert(id string) (*Cert, error) {
+	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
-		return &cert, nil
+		return nil, err
 	}
-
-	if existed {
-		return &cert, nil
-	} else {
-		return nil, nil
-	}
+	return getCert(owner, name)
 }
 
-func GetCert(id string) (*Cert, error) {
+func GetCertEx(id string) (*Cert, error) {
 	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
 		return nil, err
@@ -189,7 +169,7 @@ func UpdateCert(id string, cert *Cert) (bool, error) {
 	}
 
 	if name != cert.Name {
-		err = certChangeTrigger(name, cert.Name)
+		err = certChangeTrigger(owner, name, cert.Name)
 		if err != nil {
 			return false, err
 		}
@@ -206,6 +186,29 @@ func UpdateCert(id string, cert *Cert) (bool, error) {
 	}
 
 	return affected != 0, nil
+}
+
+// CheckCertName keeps a cert name unique across owners, because the name is the "kid" of the
+// global JWKS, where another owner's cert of the same name would be taken for this one.
+func CheckCertName(cert *Cert, oldId string, lang string) error {
+	if cert.GetId() == oldId {
+		return nil
+	}
+
+	session := ormer.Engine.Where("name = ? and owner <> ?", cert.Name, cert.Owner)
+	if oldId != "" {
+		oldOwner, oldName := util.GetOwnerAndNameFromIdNoCheck(oldId)
+		session = session.And("not (owner = ? and name = ?)", oldOwner, oldName)
+	}
+
+	existed, err := session.Exist(&Cert{})
+	if err != nil {
+		return err
+	}
+	if existed {
+		return fmt.Errorf(i18n.Translate(lang, "cert:The cert name: %s is already used by another organization"), cert.Name)
+	}
+	return nil
 }
 
 func AddCert(cert *Cert) (bool, error) {
@@ -326,7 +329,7 @@ func RenewCert(cert *Cert) (bool, error) {
 
 func getCertByApplication(application *Application) (*Cert, error) {
 	if application.Cert != "" {
-		return getCertByName(application.Cert)
+		return GetCertEx(util.GetId(application.Organization, application.Cert))
 	} else {
 		return GetDefaultCert()
 	}
@@ -336,7 +339,7 @@ func GetDefaultCert() (*Cert, error) {
 	return getCert("admin", "cert-built-in")
 }
 
-func certChangeTrigger(oldName string, newName string) error {
+func certChangeTrigger(owner string, oldName string, newName string) error {
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 
@@ -345,9 +348,21 @@ func certChangeTrigger(oldName string, newName string) error {
 		return err
 	}
 
-	application := new(Application)
-	application.Cert = newName
-	_, err = session.Where("cert=?", oldName).Update(application)
+	// global ("admin") certs are visible to every organization, others only to their own
+	appSession := session.Where("cert=?", oldName)
+	if owner != "admin" {
+		appSession = appSession.And("organization=?", owner)
+	}
+	_, err = appSession.Cols("cert").Update(&Application{Cert: newName})
+	if err != nil {
+		return err
+	}
+
+	providerSession := session.Where("cert=?", oldName)
+	if owner != "admin" {
+		providerSession = providerSession.And("owner=?", owner)
+	}
+	_, err = providerSession.Cols("cert").Update(&Provider{Cert: newName})
 	if err != nil {
 		return err
 	}

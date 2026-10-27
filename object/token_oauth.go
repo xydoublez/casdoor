@@ -21,9 +21,10 @@ import (
 
 	"github.com/casdoor/casdoor/idp"
 	"github.com/casdoor/casdoor/util"
+	"github.com/golang-jwt/jwt/v5"
 )
 
-func GetOAuthToken(grantType string, clientId string, clientSecret string, code string, verifier string, scope string, nonce string, username string, password string, host string, refreshToken string, tag string, avatar string, lang string, subjectToken string, subjectTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, dpopProof string) (interface{}, error) {
+func GetOAuthToken(grantType string, clientId string, clientSecret string, code string, verifier string, scope string, nonce string, username string, password string, countryCode string, host string, refreshToken string, tag string, avatar string, lang string, subjectToken string, subjectTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, dpopProof string, clientIp string) (interface{}, error) {
 	var (
 		application *Application
 		err         error
@@ -31,7 +32,7 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 	)
 
 	if clientAssertionType == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
-		ok, application, err = ValidateClientAssertion(clientAssertion, host)
+		ok, application, err = ValidateClientAssertion(clientAssertion, clientId, host)
 		if err != nil {
 			return nil, err
 		}
@@ -83,23 +84,27 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 	var tokenError *TokenError
 	switch grantType {
 	case "authorization_code": // Authorization Code Grant
-		token, tokenError, err = GetAuthorizationCodeToken(application, clientSecret, code, verifier, resource)
+		token, tokenError, err = GetAuthorizationCodeToken(application, clientSecret, code, verifier, resource, lang)
 	case "password": // Resource Owner Password Credentials Grant
-		token, tokenError, err = GetPasswordToken(application, username, password, scope, host)
+		token, tokenError, err = GetPasswordToken(application, username, password, scope, host, clientIp, lang)
 	case "client_credentials": // Client Credentials Grant
 		token, tokenError, err = GetClientCredentialsToken(application, clientSecret, scope, host)
+	case VerificationCodeGrantType:
+		token, tokenError, err = GetVerificationCodeToken(application, username, countryCode, code, scope, host, clientIp, lang)
+	case MobileOneClickGrantType:
+		token, tokenError, err = GetMobileOneClickToken(application, code, scope, host, clientIp, lang)
 	case "token", "id_token": // Implicit Grant
-		token, tokenError, err = GetImplicitToken(application, username, password, scope, nonce, host)
+		token, tokenError, err = GetImplicitToken(application, username, password, scope, nonce, host, clientIp, lang)
 	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
-		token, tokenError, err = GetJwtBearerToken(application, assertion, scope, nonce, host)
+		token, tokenError, err = GetJwtBearerToken(application, assertion, scope, nonce, host, clientIp, lang)
 	case "urn:ietf:params:oauth:grant-type:device_code":
 		// The user has already authenticated via browser in the device flow,
 		// so we skip password verification and mint a token directly.
-		token, tokenError, err = mintImplicitToken(application, username, scope, nonce, host)
+		token, tokenError, err = GetDeviceCodeToken(application, username, scope, nonce, host)
 	case "urn:ietf:params:oauth:grant-type:token-exchange": // Token Exchange Grant (RFC 8693)
 		token, tokenError, err = GetTokenExchangeToken(application, clientSecret, subjectToken, subjectTokenType, audience, scope, host)
 	case "refresh_token":
-		refreshToken2, err := RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, resource, host, dpopProof)
+		refreshToken2, err := RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, resource, host, dpopProof, "/api/login/oauth/access_token")
 		if err != nil {
 			return nil, err
 		}
@@ -140,7 +145,7 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 
 	tokenWrapper := &TokenWrapper{
 		AccessToken:  token.AccessToken,
-		IdToken:      token.AccessToken,
+		IdToken:      token.IdToken,
 		RefreshToken: token.RefreshToken,
 		TokenType:    token.TokenType,
 		ExpiresIn:    token.ExpiresIn,
@@ -151,7 +156,7 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 }
 
 // GetAuthorizationCodeToken handles the Authorization Code Grant flow.
-func GetAuthorizationCodeToken(application *Application, clientSecret string, code string, verifier string, resource string) (*Token, *TokenError, error) {
+func GetAuthorizationCodeToken(application *Application, clientSecret string, code string, verifier string, resource string, lang string) (*Token, *TokenError, error) {
 	if code == "" {
 		return nil, &TokenError{
 			Error:            InvalidRequest,
@@ -179,7 +184,7 @@ func GetAuthorizationCodeToken(application *Application, clientSecret string, co
 				ErrorDescription: "sign up is not enabled for this application",
 			}, nil
 		}
-		return createGuestUserToken(application, clientSecret, verifier)
+		return createGuestUserToken(application, clientSecret, verifier, lang)
 	}
 
 	token, err := getTokenByCode(code)
@@ -253,11 +258,26 @@ func GetAuthorizationCodeToken(application *Application, clientSecret string, co
 			ErrorDescription: fmt.Sprintf("authorization code has expired, nowUnix: [%s], token.CodeExpireIn: [%s]", time.Unix(nowUnix, 0).Format(time.RFC3339), time.Unix(token.CodeExpireIn, 0).Format(time.RFC3339)),
 		}, nil
 	}
+
+	claimed, err := claimAuthorizationCode(token.Code)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !claimed {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("authorization code has been used for token: [%s]", token.GetId()),
+		}, nil
+	}
+
+	if clientSecret != "" {
+		token.GrantType = "authorization_code"
+	}
 	return token, nil, nil
 }
 
 // GetPasswordToken handles the Resource Owner Password Credentials Grant flow.
-func GetPasswordToken(application *Application, username string, password string, scope string, host string) (*Token, *TokenError, error) {
+func GetPasswordToken(application *Application, username string, password string, scope string, host string, clientIp string, lang string) (*Token, *TokenError, error) {
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -279,7 +299,7 @@ func GetPasswordToken(application *Application, username string, password string
 	}
 
 	if user.Ldap != "" {
-		err = CheckLdapUserPassword(user, password, "en")
+		err = CheckLdapUserPassword(user, password, lang)
 	} else {
 		// For OAuth users who don't have a password set, they cannot use password grant type
 		if user.Password == "" {
@@ -288,7 +308,7 @@ func GetPasswordToken(application *Application, username string, password string
 				ErrorDescription: "OAuth users cannot use password grant type, please use authorization code flow",
 			}, nil
 		}
-		err = CheckPassword(user, password, "en")
+		err = CheckPassword(user, password, lang)
 	}
 	if err != nil {
 		return nil, &TokenError{
@@ -297,19 +317,29 @@ func GetPasswordToken(application *Application, username string, password string
 		}, nil
 	}
 
-	if user.IsForbidden {
-		return nil, &TokenError{
-			Error:            InvalidGrant,
-			ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
-		}, nil
+	if tokenError := getMfaUserTokenError(user); tokenError != nil {
+		return nil, tokenError, nil
 	}
 
-	err = ExtendUserWithRolesAndPermissions(user)
+	if tokenError := getSigninPolicyTokenError(user, lang); tokenError != nil {
+		return nil, tokenError, nil
+	}
+
+	if tokenError := checkGrantUserSignin(application, user, clientIp, lang); tokenError != nil {
+		return nil, tokenError, nil
+	}
+
+	return getUserGrantToken(application, user, scope, host)
+}
+
+// getUserGrantToken issues the token of a grant whose user has been authenticated by the grant itself
+func getUserGrantToken(application *Application, user *User, scope string, host string) (*Token, *TokenError, error) {
+	err := ExtendUserWithRolesAndPermissions(user)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	accessToken, refreshToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, "", host)
+	accessToken, refreshToken, idToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, "", host)
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -331,9 +361,10 @@ func GetPasswordToken(application *Application, username string, password string
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
-		Code:         util.GenerateClientId(),
+		Code:         util.GenerateAuthorizationCode(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		IdToken:      idToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        scope,
 		TokenType:    "Bearer",
@@ -355,6 +386,10 @@ func GetClientCredentialsToken(application *Application, clientSecret string, sc
 			ErrorDescription: "client_secret is invalid",
 		}, nil
 	}
+	return getApplicationToken(application, scope, host, "client_credentials")
+}
+
+func getApplicationToken(application *Application, scope string, host string, grantType string) (*Token, *TokenError, error) {
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -370,7 +405,7 @@ func GetClientCredentialsToken(application *Application, clientSecret string, sc
 		Type:  "application",
 	}
 
-	accessToken, _, tokenName, err := generateJwtToken(application, nullUser, "", "", "", scope, "", host)
+	accessToken, _, _, tokenName, err := generateJwtToken(application, nullUser, "", "", "", scope, "", host)
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -384,12 +419,12 @@ func GetClientCredentialsToken(application *Application, clientSecret string, sc
 		Application:  application.Name,
 		Organization: application.Organization,
 		User:         nullUser.Name,
-		Code:         util.GenerateClientId(),
+		Code:         util.GenerateAuthorizationCode(),
 		AccessToken:  accessToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        scope,
 		TokenType:    "Bearer",
-		GrantType:    "client_credentials",
+		GrantType:    grantType,
 		CodeIsUsed:   true,
 	}
 	_, err = AddToken(token)
@@ -401,7 +436,7 @@ func GetClientCredentialsToken(application *Application, clientSecret string, sc
 }
 
 // GetImplicitToken handles the Implicit Grant flow (requires password verification).
-func GetImplicitToken(application *Application, username string, password string, scope string, nonce string, host string) (*Token, *TokenError, error) {
+func GetImplicitToken(application *Application, username string, password string, scope string, nonce string, host string, clientIp string, lang string) (*Token, *TokenError, error) {
 	user, err := GetUserByFieldsForSharedApp(application, application.Organization, username)
 	if err != nil {
 		return nil, nil, err
@@ -414,7 +449,7 @@ func GetImplicitToken(application *Application, username string, password string
 	}
 
 	if user.Ldap != "" {
-		err = CheckLdapUserPassword(user, password, "en")
+		err = CheckLdapUserPassword(user, password, lang)
 	} else {
 		if user.Password == "" {
 			return nil, &TokenError{
@@ -422,7 +457,7 @@ func GetImplicitToken(application *Application, username string, password string
 				ErrorDescription: "OAuth users cannot use implicit grant type, please use authorization code flow",
 			}, nil
 		}
-		err = CheckPassword(user, password, "en")
+		err = CheckPassword(user, password, lang)
 	}
 	if err != nil {
 		return nil, &TokenError{
@@ -431,11 +466,91 @@ func GetImplicitToken(application *Application, username string, password string
 		}, nil
 	}
 
-	return mintImplicitToken(application, username, scope, nonce, host)
+	if tokenError := getMfaUserTokenError(user); tokenError != nil {
+		return nil, tokenError, nil
+	}
+
+	if tokenError := getSigninPolicyTokenError(user, lang); tokenError != nil {
+		return nil, tokenError, nil
+	}
+
+	if tokenError := checkGrantUserSignin(application, user, clientIp, lang); tokenError != nil {
+		return nil, tokenError, nil
+	}
+
+	return mintTokenForUser(application, user, scope, nonce, host)
+}
+
+func checkGrantUserSignin(application *Application, user *User, clientIp string, lang string) *TokenError {
+	err := CheckApplicationSignin(application, user, clientIp, lang)
+	if err != nil {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: err.Error(),
+		}
+	}
+	return nil
+}
+
+// getMfaUserTokenError refuses a password-only grant for an MFA-enabled user, the same as
+// the password in the URL of AutoSigninFilter, or the password alone would skip the second factor
+func getMfaUserTokenError(user *User) *TokenError {
+	if !user.IsMfaEnabled() {
+		return nil
+	}
+
+	return &TokenError{
+		Error:            InvalidGrant,
+		ErrorDescription: "the user has MFA enabled and cannot sign in with a password grant, please use the authorization code flow",
+	}
+}
+
+func getSigninPolicyTokenError(user *User, lang string) *TokenError {
+	err := CheckPasswordOnlySignin(user, "", lang)
+	if err == nil {
+		return nil
+	}
+
+	return &TokenError{
+		Error:            InvalidGrant,
+		ErrorDescription: err.Error(),
+	}
+}
+
+func getInactiveUserTokenError(user *User) *TokenError {
+	if !user.IsForbidden && !user.IsDeleted {
+		return nil
+	}
+
+	return &TokenError{
+		Error:            InvalidGrant,
+		ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
+	}
 }
 
 // GetJwtBearerToken handles the JWT Bearer Grant flow (RFC 7523).
-func GetJwtBearerToken(application *Application, assertion string, scope string, nonce string, host string) (*Token, *TokenError, error) {
+func GetJwtBearerToken(application *Application, assertion string, scope string, nonce string, host string, clientIp string, lang string) (*Token, *TokenError, error) {
+	credential, federatedClaims, err := validateFederatedToken(application, assertion, host)
+	if err != nil {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: err.Error(),
+		}, nil
+	}
+	if credential != nil {
+		user, tokenError, err := getFederatedUser(application, credential, federatedClaims)
+		if err != nil || tokenError != nil {
+			return nil, tokenError, err
+		}
+		if user == nil {
+			return getApplicationToken(application, scope, host, "urn:ietf:params:oauth:grant-type:jwt-bearer")
+		}
+		if tokenError = checkGrantUserSignin(application, user, clientIp, lang); tokenError != nil {
+			return nil, tokenError, nil
+		}
+		return mintTokenForUser(application, user, scope, nonce, host)
+	}
+
 	ok, claims, err := ValidateJwtAssertion(assertion, application, host)
 	if err != nil || !ok {
 		if err != nil {
@@ -452,17 +567,25 @@ func GetJwtBearerToken(application *Application, assertion string, scope string,
 	}
 
 	// JWT assertion has already been validated above; skip password re-verification
-	return mintImplicitToken(application, claims.Subject, scope, nonce, host)
+	return mintImplicitToken(application, claims.Subject, scope, nonce, host, clientIp, lang)
 }
 
 // GetTokenByUser mints a token for the given user (Implicit flow helper).
-func GetTokenByUser(application *Application, user *User, scope string, nonce string, host string) (*Token, error) {
+func GetTokenByUser(application *Application, user *User, scope string, nonce string, sessionId string, host string) (*Token, error) {
+	return GetTokenByUserWithAuth(application, user, scope, nonce, sessionId, host, 0, false)
+}
+
+// GetTokenByUserWithAuth mints the tokens an implicit flow returns from the authorization endpoint:
+// authTime is when the user entered credentials, withAtHash is set when the access token is
+// returned together with the ID token
+func GetTokenByUserWithAuth(application *Application, user *User, scope string, nonce string, sessionId string, host string, authTime int64, withAtHash bool) (*Token, error) {
 	err := ExtendUserWithRolesAndPermissions(user)
 	if err != nil {
 		return nil, err
 	}
 
-	accessToken, refreshToken, tokenName, err := generateJwtToken(application, user, "", "", nonce, scope, "", host)
+	options := jwtTokenOptions{AuthTime: authTime, WithAtHash: withAtHash}
+	accessToken, refreshToken, idToken, tokenName, err := generateJwtTokenWithOptions(application, user, "", "", nonce, scope, "", host, options)
 	if err != nil {
 		return nil, err
 	}
@@ -474,13 +597,15 @@ func GetTokenByUser(application *Application, user *User, scope string, nonce st
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
-		Code:         util.GenerateClientId(),
+		Code:         util.GenerateAuthorizationCode(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		IdToken:      idToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        scope,
 		TokenType:    "Bearer",
 		CodeIsUsed:   true,
+		SessionId:    sessionId,
 	}
 	_, err = AddToken(token)
 	if err != nil {
@@ -526,7 +651,7 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 	}
 
 	if user == nil {
-		if !application.EnableSignUp {
+		if !application.EnableSignUp || !application.IsSignupAllowedFor(application.Organization) {
 			return nil, &TokenError{
 				Error:            InvalidGrant,
 				ErrorDescription: "the application does not allow to sign up new account",
@@ -564,10 +689,14 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 				UserPropertiesWechatUnionId: unionId,
 			},
 		}
-		_, err = AddUser(user, "en")
+		_, err = AddUser(user, lang)
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+
+	if tokenError := getInactiveUserTokenError(user); tokenError != nil {
+		return nil, tokenError, nil
 	}
 
 	err = ExtendUserWithRolesAndPermissions(user)
@@ -575,7 +704,7 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 		return nil, nil, err
 	}
 
-	accessToken, refreshToken, tokenName, err := generateJwtToken(application, user, "", "", "", "", "", host)
+	accessToken, refreshToken, idToken, tokenName, err := generateJwtToken(application, user, "", "", "", "", "", host)
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -593,6 +722,7 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 		Code:         session.SessionKey, // a trick, because miniprogram does not use the code, so use the code field to save the session_key
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		IdToken:      idToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        "",
 		TokenType:    "Bearer",
@@ -608,6 +738,17 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 // GetTokenExchangeToken handles the Token Exchange Grant flow (RFC 8693).
 // Exchanges a subject token for a new token with different audience or scope.
 func GetTokenExchangeToken(application *Application, clientSecret string, subjectToken string, subjectTokenType string, audience string, scope string, host string) (*Token, *TokenError, error) {
+	credential, federatedClaims, err := validateFederatedToken(application, subjectToken, host)
+	if err != nil {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error()),
+		}, nil
+	}
+	if credential != nil {
+		return getFederatedTokenExchangeToken(application, credential, federatedClaims, audience, scope, host)
+	}
+
 	if application.ClientSecret != clientSecret {
 		return nil, &TokenError{
 			Error:            InvalidClient,
@@ -656,6 +797,24 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		return nil, tokenError, nil
 	}
 
+	// A valid signature is not enough: the subject token must still be active, the same
+	// way the refresh_token grant checks it, or a revoked token can be exchanged forever.
+	var subjectTokenRecord *Token
+	if subjectTokenType == "urn:ietf:params:oauth:token-type:id_token" {
+		subjectTokenRecord, err = GetTokenByIdToken(subjectToken)
+	} else {
+		subjectTokenRecord, err = GetTokenByAccessToken(subjectToken)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if subjectTokenRecord == nil || subjectTokenRecord.ExpiresIn <= 0 {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "subject_token is revoked or unknown",
+		}, nil
+	}
+
 	user, err := getUser(subjectOwner, subjectName)
 	if err != nil {
 		return nil, nil, err
@@ -672,6 +831,42 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 			Error:            InvalidGrant,
 			ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
 		}, nil
+	}
+
+	// the same as signing in: only a shared application serves the users of other organizations
+	if user.Owner != application.Organization && !application.IsShared {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("user from subject_token: %s does not belong to the organization of the application: %s", user.GetId(), application.Organization),
+		}, nil
+	}
+
+	// RFC 8693: "audience" is the target service the new token is for, by client ID or by application name
+	targetAudience := ""
+	if audience != "" {
+		targetApplication, err := GetApplicationByClientId(audience)
+		if err != nil {
+			return nil, nil, err
+		}
+		if targetApplication == nil {
+			targetApplication, err = getApplication(application.Owner, audience)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if targetApplication == nil {
+			return nil, &TokenError{
+				Error:            InvalidTarget,
+				ErrorDescription: fmt.Sprintf("the requested audience is not a known application: %s", audience),
+			}, nil
+		}
+		if user.Owner != targetApplication.Organization && !targetApplication.IsShared {
+			return nil, &TokenError{
+				Error:            InvalidTarget,
+				ErrorDescription: fmt.Sprintf("the requested audience: %s does not serve the organization of the user: %s", audience, user.GetId()),
+			}, nil
+		}
+		targetAudience = targetApplication.ClientId
 	}
 
 	// If scope is not provided, use the scope from the subject token.
@@ -708,7 +903,7 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		return nil, nil, err
 	}
 
-	accessToken, refreshToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, "", host)
+	accessToken, refreshToken, idToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, targetAudience, host)
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -723,13 +918,16 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
-		Code:         util.GenerateClientId(),
+		Code:         util.GenerateAuthorizationCode(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		IdToken:      idToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        scope,
 		TokenType:    "Bearer",
 		CodeIsUsed:   true,
+		Resource:     targetAudience,
+		GrantType:    "urn:ietf:params:oauth:grant-type:token-exchange",
 	}
 
 	_, err = AddToken(token)
@@ -749,10 +947,119 @@ func GetAccessTokenByUser(user *User, host string) (string, error) {
 		return "", fmt.Errorf("the application for user %s is not found", user.Id)
 	}
 
-	token, err := GetTokenByUser(application, user, "profile", "", host)
+	token, err := GetTokenByUser(application, user, "profile", "", "", host)
 	if err != nil {
 		return "", err
 	}
 
 	return token.AccessToken, nil
+}
+
+// getFederatedTokenExchangeToken exchanges a token of an external issuer trusted by the application.
+// The verified token is the credential, so no client secret is involved.
+func getFederatedTokenExchangeToken(application *Application, credential *FederatedCredential, claims jwt.MapClaims, audience string, scope string, host string) (*Token, *TokenError, error) {
+	user, tokenError, err := getFederatedUser(application, credential, claims)
+	if err != nil || tokenError != nil {
+		return nil, tokenError, err
+	}
+
+	expandedScope, ok := IsScopeValidAndExpand(scope, application)
+	if !ok {
+		return nil, &TokenError{
+			Error:            InvalidScope,
+			ErrorDescription: "the requested scope is invalid or not defined in the application",
+		}, nil
+	}
+	scope = expandedScope
+
+	organization := application.Organization
+	isApplication := user == nil
+	if isApplication {
+		user = &User{
+			Owner: application.Owner,
+			Id:    application.GetId(),
+			Name:  application.Name,
+			Type:  "application",
+		}
+	} else {
+		organization = user.Owner
+		if user.IsForbidden {
+			return nil, &TokenError{
+				Error:            InvalidGrant,
+				ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
+			}, nil
+		}
+	}
+
+	targetAudience := ""
+	if audience != "" {
+		targetApplication, err := GetApplicationByClientId(audience)
+		if err != nil {
+			return nil, nil, err
+		}
+		if targetApplication == nil {
+			targetApplication, err = getApplication(application.Owner, audience)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if targetApplication == nil {
+			return nil, &TokenError{
+				Error:            InvalidTarget,
+				ErrorDescription: fmt.Sprintf("the requested audience is not a known application: %s", audience),
+			}, nil
+		}
+		if organization != targetApplication.Organization && !targetApplication.IsShared {
+			return nil, &TokenError{
+				Error:            InvalidTarget,
+				ErrorDescription: fmt.Sprintf("the requested audience: %s does not serve the organization: %s", audience, organization),
+			}, nil
+		}
+		targetAudience = targetApplication.ClientId
+	}
+
+	if !isApplication {
+		err = ExtendUserWithRolesAndPermissions(user)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	accessToken, refreshToken, idToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, targetAudience, host)
+	if err != nil {
+		return nil, &TokenError{
+			Error:            EndpointError,
+			ErrorDescription: fmt.Sprintf("generate jwt token error: %s", err.Error()),
+		}, nil
+	}
+	if isApplication {
+		refreshToken = ""
+		idToken = ""
+	}
+
+	token := &Token{
+		Owner:        application.Owner,
+		Name:         tokenName,
+		CreatedTime:  util.GetCurrentTime(),
+		Application:  application.Name,
+		Organization: organization,
+		User:         user.Name,
+		Code:         util.GenerateAuthorizationCode(),
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		IdToken:      idToken,
+		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
+		Scope:        scope,
+		TokenType:    "Bearer",
+		CodeIsUsed:   true,
+		Resource:     targetAudience,
+		GrantType:    "urn:ietf:params:oauth:grant-type:token-exchange",
+	}
+
+	_, err = AddToken(token)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return token, nil, nil
 }

@@ -54,13 +54,14 @@ func InitAPI() {
 	web.Router("/api/logout", &controllers.ApiController{}, "GET,POST:Logout")
 	web.Router("/api/sso-logout", &controllers.ApiController{}, "GET,POST:SsoLogout")
 	web.Router("/api/get-account", &controllers.ApiController{}, "GET:GetAccount")
-	web.Router("/api/userinfo", &controllers.ApiController{}, "GET:GetUserinfo")
+	web.Router("/api/userinfo", &controllers.ApiController{}, "GET,POST:GetUserinfo")
 	web.Router("/api/user", &controllers.ApiController{}, "GET:GetUserinfo2")
 	web.Router("/api/unlink", &controllers.ApiController{}, "POST:Unlink")
 	web.Router("/api/get-saml-login", &controllers.ApiController{}, "GET:GetSamlLogin")
 	web.Router("/api/acs", &controllers.ApiController{}, "POST:HandleSamlLogin")
 	web.Router("/api/saml/metadata", &controllers.ApiController{}, "GET:GetSamlMeta")
 	web.Router("/api/saml/redirect/:owner/:application", &controllers.ApiController{}, "*:HandleSamlRedirect")
+	web.Router("/api/saml/logout/:owner/:application", &controllers.ApiController{}, "GET,POST:HandleSamlLogout")
 	web.Router("/api/webhook", &controllers.ApiController{}, "*:HandleOfficialAccountEvent")
 	web.Router("/api/get-qrcode", &controllers.ApiController{}, "GET:GetQRCode")
 	web.Router("/api/get-webhook-event", &controllers.ApiController{}, "GET:GetWebhookEventType")
@@ -120,9 +121,17 @@ func InitAPI() {
 	web.Router("/api/get-providers", &controllers.ApiController{}, "GET:GetProviders")
 	web.Router("/api/get-provider", &controllers.ApiController{}, "GET:GetProvider")
 	web.Router("/api/get-global-providers", &controllers.ApiController{}, "GET:GetGlobalProviders")
+	web.Router("/api/get-idp-discovery", &controllers.ApiController{}, "GET:GetIdpDiscovery")
 	web.Router("/api/update-provider", &controllers.ApiController{}, "POST:UpdateProvider")
 	web.Router("/api/add-provider", &controllers.ApiController{}, "POST:AddProvider")
 	web.Router("/api/delete-provider", &controllers.ApiController{}, "POST:DeleteProvider")
+
+	web.Router("/api/get-marketplace-index", &controllers.ApiController{}, "GET:GetMarketplaceIndex")
+	web.Router("/api/get-marketplace-bundle", &controllers.ApiController{}, "GET:GetMarketplaceBundle")
+	web.Router("/api/get-integrations", &controllers.ApiController{}, "GET:GetIntegrations")
+	web.Router("/api/get-integration", &controllers.ApiController{}, "GET:GetIntegration")
+	web.Router("/api/install-integration", &controllers.ApiController{}, "POST:InstallIntegration")
+	web.Router("/api/delete-integration", &controllers.ApiController{}, "POST:DeleteIntegration")
 
 	web.Router("/api/get-resources", &controllers.ApiController{}, "GET:GetResources")
 	web.Router("/api/get-resource", &controllers.ApiController{}, "GET:GetResource")
@@ -236,9 +245,6 @@ func InitAPI() {
 	web.Router("/api/get-all-actions", &controllers.ApiController{}, "GET:GetAllActions")
 	web.Router("/api/get-all-roles", &controllers.ApiController{}, "GET:GetAllRoles")
 
-	web.Router("/api/run-casbin-command", &controllers.ApiController{}, "GET:RunCasbinCommand")
-	web.Router("/api/refresh-engines", &controllers.ApiController{}, "POST:RefreshEngines")
-
 	web.Router("/api/get-sessions", &controllers.ApiController{}, "GET:GetSessions")
 	web.Router("/api/get-session", &controllers.ApiController{}, "GET:GetSingleSession")
 	web.Router("/api/update-session", &controllers.ApiController{}, "POST:UpdateSession")
@@ -300,6 +306,7 @@ func InitAPI() {
 	web.Router("/api/get-subscriptions", &controllers.ApiController{}, "GET:GetSubscriptions")
 	web.Router("/api/get-subscription", &controllers.ApiController{}, "GET:GetSubscription")
 	web.Router("/api/update-subscription", &controllers.ApiController{}, "POST:UpdateSubscription")
+	web.Router("/api/set-subscription-auto-renew", &controllers.ApiController{}, "POST:SetSubscriptionAutoRenew")
 	web.Router("/api/add-subscription", &controllers.ApiController{}, "POST:AddSubscription")
 	web.Router("/api/delete-subscription", &controllers.ApiController{}, "POST:DeleteSubscription")
 
@@ -311,6 +318,10 @@ func InitAPI() {
 
 	web.Router("/api/get-system-info", &controllers.ApiController{}, "GET:GetSystemInfo")
 	web.Router("/api/get-version-info", &controllers.ApiController{}, "GET:GetVersionInfo")
+	web.Router("/api/get-upgrade-info", &controllers.ApiController{}, "GET:GetUpgradeInfo")
+	web.Router("/api/upgrade-system", &controllers.ApiController{}, "POST:UpgradeSystem")
+	web.Router("/api/get-setting", &controllers.ApiController{}, "GET:GetSetting")
+	web.Router("/api/update-setting", &controllers.ApiController{}, "POST:UpdateSetting")
 	web.Router("/api/health", &controllers.ApiController{}, "GET:Health")
 	web.Router("/api/get-prometheus-info", &controllers.ApiController{}, "GET:GetPrometheusInfo")
 	web.Router("/api/metrics", &controllers.ApiController{}, "GET:GetMetrics")
@@ -327,7 +338,7 @@ func InitAPI() {
 	web.Router("/api/update-syncer", &controllers.ApiController{}, "POST:UpdateSyncer")
 	web.Router("/api/add-syncer", &controllers.ApiController{}, "POST:AddSyncer")
 	web.Router("/api/delete-syncer", &controllers.ApiController{}, "POST:DeleteSyncer")
-	web.Router("/api/run-syncer", &controllers.ApiController{}, "GET:RunSyncer")
+	web.Router("/api/run-syncer", &controllers.ApiController{}, "POST:RunSyncer")
 	web.Router("/api/test-syncer-db", &controllers.ApiController{}, "POST:TestSyncerDb")
 
 	web.Router("/api/get-webhooks", &controllers.ApiController{}, "GET:GetWebhooks")
@@ -350,6 +361,8 @@ func InitAPI() {
 	web.Router("/api/add-ticket-message", &controllers.ApiController{}, "POST:AddTicketMessage")
 
 	web.Router("/api/set-password", &controllers.ApiController{}, "POST:SetPassword")
+	web.Router("/api/get-init-admin-status", &controllers.ApiController{}, "GET:GetInitAdminStatus")
+	web.Router("/api/init-admin-password", &controllers.ApiController{}, "POST:InitAdminPassword")
 	web.Router("/api/check-user-password", &controllers.ApiController{}, "POST:CheckUserPassword")
 	web.Router("/api/get-email-and-phone", &controllers.ApiController{}, "GET:GetEmailAndPhone")
 	web.Router("/api/send-verification-code", &controllers.ApiController{}, "POST:SendVerificationCode")
@@ -370,6 +383,7 @@ func InitAPI() {
 	web.Router("/api/login/oauth/access_token", &controllers.ApiController{}, "POST:GetOAuthToken")
 	web.Router("/api/login/oauth/refresh_token", &controllers.ApiController{}, "POST:RefreshToken")
 	web.Router("/api/login/oauth/introspect", &controllers.ApiController{}, "POST:IntrospectToken")
+	web.Router("/api/login/oauth/revoke", &controllers.ApiController{}, "POST:RevokeToken")
 	web.Router("/api/oauth/register", &controllers.ApiController{}, "POST:DynamicClientRegister")
 	web.Router("/api/oauth/register/:clientId", &controllers.ApiController{}, "GET:DynamicClientRead;PUT:DynamicClientUpdate;DELETE:DynamicClientDelete")
 

@@ -15,13 +15,31 @@
 (function() {
   "use strict";
 
+  // the path Casdoor is served under, like "/casdoor", which the server writes into the page (routers/base_path.go)
+  var basePath = (function() {
+    var meta = document.querySelector("meta[name=\"casdoor-base-path\"]");
+    var value = meta ? (meta.getAttribute("content") || "").replace(/^\/+|\/+$/g, "") : "";
+    return value ? "/" + value : "";
+  })();
+
   var reactFallbackKey = "__casdoor_callback_react";
   var reactFallbackPayloadKey = "casdoor_callback_react_fallback";
+
+  function getIssuer() {
+    var meta = document.querySelector("meta[name=\"casdoor-issuer\"]");
+    return (meta && meta.getAttribute("content")) || window.location.origin + basePath;
+  }
 
   function setStatus(message, isError) {
     var statusNode = document.getElementById("callback-status");
     if (!statusNode) {
       return;
+    }
+
+    // a message replaces the spinner the page starts with
+    var spinnerNode = document.getElementById("callback-spinner");
+    if (spinnerNode) {
+      spinnerNode.style.display = "none";
     }
 
     statusNode.textContent = message;
@@ -56,6 +74,24 @@
     return query;
   }
 
+  // Keep in sync with consumeLinkNonce() in src/auth/Util.ts
+  function consumeLinkNonce(nonce) {
+    var expected = sessionStorage.getItem("casdoor_link_nonce");
+    sessionStorage.removeItem("casdoor_link_nonce");
+    return !!nonce && nonce === expected;
+  }
+
+  function getParameterIgnoreCase(params, key) {
+    var target = key.toLowerCase();
+    var result = null;
+    params.forEach(function(val, name) {
+      if (result === null && name.toLowerCase() === target) {
+        result = val;
+      }
+    });
+    return result;
+  }
+
   function getInnerParams() {
     var params = new URLSearchParams(window.location.search);
     var state = params.get("state");
@@ -72,7 +108,7 @@
     if (method === "signup" || method === "signin") {
       var realRedirectUri = innerParams.get("redirect_uri");
       if (realRedirectUri === null) {
-        var samlRequest = innerParams.get("SAMLRequest");
+        var samlRequest = getParameterIgnoreCase(innerParams, "SAMLRequest");
         var casService = innerParams.get("service");
         if (samlRequest) {
           return "saml";
@@ -83,8 +119,8 @@
         return "login";
       }
 
-      var realRedirectUrl = new URL(realRedirectUri).origin;
-      if (window.location.origin === realRedirectUrl) {
+      var realRedirectUrl = new URL(realRedirectUri);
+      if (window.location.origin === realRedirectUrl.origin && (basePath === "" || realRedirectUrl.pathname === basePath || realRedirectUrl.pathname.indexOf(basePath + "/") === 0)) {
         return "login";
       }
 
@@ -173,15 +209,15 @@
       ? "&resource=" + encodeURIComponent(oAuthParams.resource)
       : "";
 
-    return "?clientId=" + oAuthParams.clientId +
-      "&responseType=" + oAuthParams.responseType +
+    return "?clientId=" + encodeURIComponent(oAuthParams.clientId) +
+      "&responseType=" + encodeURIComponent(oAuthParams.responseType) +
       "&redirectUri=" + encodeURIComponent(oAuthParams.redirectUri) +
-      "&type=" + oAuthParams.type +
-      "&scope=" + oAuthParams.scope +
-      "&state=" + oAuthParams.state +
-      "&nonce=" + oAuthParams.nonce +
-      "&code_challenge_method=" + oAuthParams.challengeMethod +
-      "&code_challenge=" + oAuthParams.codeChallenge +
+      "&type=" + encodeURIComponent(oAuthParams.type) +
+      "&scope=" + encodeURIComponent(oAuthParams.scope) +
+      "&state=" + encodeURIComponent(oAuthParams.state) +
+      "&nonce=" + encodeURIComponent(oAuthParams.nonce) +
+      "&code_challenge_method=" + encodeURIComponent(oAuthParams.challengeMethod) +
+      "&code_challenge=" + encodeURIComponent(oAuthParams.codeChallenge) +
       resourceQuery;
   }
 
@@ -205,16 +241,46 @@
     form.submit();
   }
 
+  // Keep in sync with sendOAuthResponse and getTokenResponsePayload in src/auth/Util.ts
+  function sendOAuthResponse(oAuthParams, payload) {
+    if (oAuthParams.state) {
+      payload.state = oAuthParams.state;
+    }
+    payload.iss = getIssuer();
+    if (oAuthParams.responseMode === "form_post") {
+      createFormAndSubmit(oAuthParams.redirectUri, payload);
+      return;
+    }
+
+    var hasToken = "access_token" in payload || "id_token" in payload;
+    var inFragment = oAuthParams.responseMode === "fragment" || hasToken ||
+      (oAuthParams.responseMode !== "query" && (oAuthParams.responseType || "code") !== "code");
+    var concatChar = inFragment ? "#" : oAuthParams.redirectUri.indexOf("?") !== -1 ? "&" : "?";
+    var query = new URLSearchParams();
+    Object.keys(payload).forEach(function(key) {
+      query.append(key, payload[key]);
+    });
+    window.location.replace(oAuthParams.redirectUri + concatChar + query.toString());
+  }
+
+  function getTokenResponsePayload(responseTypes, res) {
+    var payload = {};
+    if (responseTypes.indexOf("code") !== -1) {
+      payload.code = res.data;
+    }
+    if (responseTypes.indexOf("token") !== -1) {
+      payload.access_token = responseTypes.indexOf("code") !== -1 ? res.data2 : res.data;
+      payload.token_type = "Bearer";
+    }
+    if (responseTypes.indexOf("id_token") !== -1) {
+      payload.id_token = res.data3;
+    }
+    return payload;
+  }
+
   function extractCallbackCode(params) {
     var isSteam = params.get("openid.mode");
     var code = params.get("code") || params.get("auth_code") || params.get("authCode");
-
-    if (code === null) {
-      var web3AuthTokenKey = params.get("web3AuthTokenKey");
-      if (web3AuthTokenKey !== null) {
-        code = localStorage.getItem(web3AuthTokenKey);
-      }
-    }
 
     if (isSteam !== null && code === null) {
       code = window.location.search;
@@ -245,16 +311,29 @@
     return code;
   }
 
+  // The backend answers a login that still needs the user's consent with
+  // `data: {required: true}` instead of an authorization code.
+  function isConsentRequired(res) {
+    return !!(res.data && typeof res.data === "object" && res.data.required === true);
+  }
+
+  function goToConsentPage(applicationName, queryString) {
+    var url = new URL(getReactCallbackOrigin());
+    url.pathname = basePath + "/consent/" + encodeURIComponent(applicationName);
+    url.search = queryString || "";
+    window.location.replace(url.toString());
+  }
+
   function shouldFallbackToReact(res) {
     return res.data === "RequiredMfa" || res.data === "NextMfa" || res.data === "SelectPlan" || res.data === "BuyPlanResult" || res.data3;
   }
 
   function getFromLink() {
-    return sessionStorage.getItem("from") || "/";
+    return basePath + (sessionStorage.getItem("from") || "/");
   }
 
   async function loginCas(body, casService) {
-    return fetch(window.location.origin + "/api/login?service=" + encodeURIComponent(casService || ""), {
+    return fetch(window.location.origin + basePath + "/api/login?service=" + encodeURIComponent(casService || ""), {
       method: "POST",
       credentials: "include",
       body: JSON.stringify(body),
@@ -266,8 +345,26 @@
     });
   }
 
+  // The WeChat QR code on the sign-in page comes back here inside its frame (see
+  // web/src/auth/Provider.ts): the page around it finishes the sign-in instead.
+  function handOffToSigninPage() {
+    var frame = null;
+    try {
+      frame = window.frameElement;
+    } catch (e) {
+      frame = null;
+    }
+    if (!frame || frame.getAttribute("name") !== "casdoor-wechat-qr") {
+      return false;
+    }
+    window.parent.location.replace(window.location.href);
+    return true;
+  }
+
   async function run() {
-    setStatus("Signing in...", false);
+    if (handOffToSigninPage()) {
+      return;
+    }
 
     var params = new URLSearchParams(window.location.search);
     var innerParams = getInnerParams();
@@ -280,10 +377,15 @@
     var applicationName = innerParams.get("application");
     var providerName = innerParams.get("provider");
     var method = innerParams.get("method");
-    var samlRequest = innerParams.get("SAMLRequest");
+    var samlRequest = getParameterIgnoreCase(innerParams, "SAMLRequest");
     var code = extractCallbackCode(params);
     var responseType = getResponseType(innerParams);
-    var redirectUri = window.location.origin + "/callback";
+    if (responseType === "link" && !consumeLinkNonce(innerParams.get("linkNonce"))) {
+      setStatus("Unauthorized", true);
+      return;
+    }
+
+    var redirectUri = window.location.origin + basePath + "/callback";
     var codeVerifier = getCodeVerifier(params.get("state"));
     var body = {
       type: responseType,
@@ -334,7 +436,7 @@
     }
 
     var oAuthParams = getOAuthGetParameters(innerParams, queryString);
-    var response = await fetch(window.location.origin + "/api/login" + oAuthParamsToQuery(oAuthParams), {
+    var response = await fetch(window.location.origin + basePath + "/api/login" + oAuthParamsToQuery(oAuthParams), {
       method: "POST",
       credentials: "include",
       body: JSON.stringify(body),
@@ -345,6 +447,13 @@
     var res = await response.json();
     if (res.status !== "ok") {
       setStatus(res.msg || "Failed to sign in.", true);
+      return;
+    }
+
+    // The consent page issues the real code, so it needs the original
+    // authorization request, which is what the state carries.
+    if (isConsentRequired(res)) {
+      goToConsentPage(applicationName, queryString);
       return;
     }
 
@@ -363,8 +472,6 @@
       return;
     }
 
-    var concatChar = oAuthParams.redirectUri.indexOf("?") !== -1 ? "&" : "?";
-    var responseMode = oAuthParams.responseMode || "query";
     var responseTypes = responseType.split(" ");
 
     if (responseType === "login") {
@@ -373,25 +480,12 @@
     }
 
     if (responseType === "code") {
-      if (responseMode === "form_post") {
-        createFormAndSubmit(oAuthParams.redirectUri, {code: res.data, state: oAuthParams.state});
-      } else {
-        window.location.replace(oAuthParams.redirectUri + concatChar + "code=" + encodeURIComponent(res.data) + "&state=" + encodeURIComponent(oAuthParams.state));
-      }
+      sendOAuthResponse(oAuthParams, {code: res.data});
       return;
     }
 
     if (responseTypes.indexOf("token") !== -1 || responseTypes.indexOf("id_token") !== -1) {
-      if (responseMode === "form_post") {
-        createFormAndSubmit(oAuthParams.redirectUri, {
-          token: responseTypes.indexOf("token") !== -1 ? res.data : null,
-          id_token: responseTypes.indexOf("id_token") !== -1 ? res.data : null,
-          token_type: "bearer",
-          state: oAuthParams.state
-        });
-      } else {
-        window.location.replace(oAuthParams.redirectUri + concatChar + responseType + "=" + encodeURIComponent(res.data) + "&state=" + encodeURIComponent(oAuthParams.state) + "&token_type=bearer");
-      }
+      sendOAuthResponse(oAuthParams, getTokenResponsePayload(responseTypes, res));
       return;
     }
 
@@ -401,7 +495,7 @@
       if (oauth) {
         from += "?oauth=" + oauth;
       }
-      window.location.replace(from);
+      window.location.replace(basePath + from);
       return;
     }
 

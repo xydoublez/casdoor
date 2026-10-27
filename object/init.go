@@ -15,13 +15,18 @@
 package object
 
 import (
+	"crypto/sha256"
 	"encoding/gob"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"os"
+	"strings"
 
 	"github.com/casdoor/casdoor/conf"
+	"github.com/casdoor/casdoor/i18n"
 	"github.com/casdoor/casdoor/util"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/xorm-io/core"
 )
 
 func InitDb() {
@@ -44,6 +49,7 @@ func InitDb() {
 		initBuiltInUserEnforcer()
 	}
 
+	warnPublicBuiltInCert()
 	initWebAuthn()
 }
 
@@ -105,6 +111,9 @@ func GetDefaultAccountItems() []*AccountItem {
 		{Name: "MFA items", Visible: true, ViewRule: "Self", ModifyRule: "Self"},
 		{Name: "WebAuthn credentials", Visible: true, ViewRule: "Self", ModifyRule: "Self"},
 		{Name: "Last change password time", Visible: true, ViewRule: "Admin", ModifyRule: "Admin"},
+		{Name: "Deleted time", Visible: true, ViewRule: "Admin", ModifyRule: "Admin"},
+		{Name: "Last signin time", Visible: true, ViewRule: "Self", ModifyRule: "Admin"},
+		{Name: "Last signin IP", Visible: true, ViewRule: "Self", ModifyRule: "Admin"},
 		{Name: "Managed accounts", Visible: true, ViewRule: "Self", ModifyRule: "Self"},
 		{Name: "Face ID", Visible: true, ViewRule: "Self", ModifyRule: "Self"},
 		{Name: "MFA accounts", Visible: true, ViewRule: "Self", ModifyRule: "Self"},
@@ -135,6 +144,7 @@ func initBuiltInOrganization() bool {
 		CountryCodes:       []string{"US", "ES", "FR", "DE", "GB", "CN", "JP", "KR", "VN", "ID", "SG", "IN"},
 		DefaultAvatar:      fmt.Sprintf("%s/img/casbin.svg", conf.GetConfigString("staticBaseUrl")),
 		DefaultTokenFormat: "JWT",
+		DefaultTokenFields: []string{},
 		UserTypes:          []string{},
 		Tags:               []string{},
 		Languages:          []string{"en", "es", "fr", "de", "ja", "zh", "vi", "pt", "tr", "pl", "uk"},
@@ -169,7 +179,7 @@ func initBuiltInUser() {
 		CreatedTime:       util.GetCurrentTime(),
 		Id:                util.GenerateId(),
 		Type:              "normal-user",
-		Password:          "123",
+		Password:          getInitAdminPassword(),
 		DisplayName:       "Admin",
 		Avatar:            fmt.Sprintf("%s/img/casbin.svg", conf.GetConfigString("staticBaseUrl")),
 		Email:             "admin@example.com",
@@ -193,6 +203,82 @@ func initBuiltInUser() {
 	if err != nil {
 		panic(err)
 	}
+
+	if user.Password == "" {
+		fmt.Println("The password of built-in/admin is not set, open Casdoor in the browser to set it, or set initAdminPassword before the first start")
+	}
+}
+
+// getInitAdminPassword is the password of built-in/admin when it is created. Without initAdminPassword the
+// password is left empty and set on the welcome page, the demo site keeps the well-known "123".
+func getInitAdminPassword() string {
+	password := conf.GetConfigString("initAdminPassword")
+	if password == "" && (conf.IsDemoMode() || conf.IsDemoDatabase()) {
+		return "123"
+	}
+	return password
+}
+
+// IsInitAdminPending tells whether built-in/admin has never had a password and is waiting for one on the welcome page
+func IsInitAdminPending() (bool, error) {
+	user, err := getUser("built-in", "admin")
+	if err != nil {
+		return false, err
+	}
+
+	return user != nil && !user.IsDeleted && user.Password == "" && user.LastSigninTime == "", nil
+}
+
+// SetInitAdminPassword sets the first password of built-in/admin. It returns false if the password has been set
+// in the meantime, only the first request wins.
+func SetInitAdminPassword(password string, lang string) (bool, error) {
+	isPending, err := IsInitAdminPending()
+	if err != nil {
+		return false, err
+	}
+	if !isPending {
+		return false, nil
+	}
+
+	user, err := getUser("built-in", "admin")
+	if err != nil {
+		return false, err
+	}
+
+	organization, err := GetOrganizationByUser(user)
+	if err != nil {
+		return false, err
+	}
+	if organization == nil {
+		return false, errors.New(i18n.Translate(lang, "check:Organization does not exist"))
+	}
+
+	if password == "" {
+		return false, errors.New(i18n.Translate(lang, "check:Password cannot be empty"))
+	}
+	if strings.Contains(password, " ") {
+		return false, errors.New(i18n.Translate(lang, "user:New password cannot contain blank space."))
+	}
+	msg := CheckPasswordComplexityByOrg(organization, password, lang)
+	if msg != "" {
+		return false, errors.New(msg)
+	}
+
+	user.Password = password
+	user.UpdateUserPassword(organization)
+	user.LastChangePasswordTime = util.GetCurrentTime()
+	user.UpdatedTime = user.LastChangePasswordTime
+	err = user.UpdateUserHash()
+	if err != nil {
+		return false, err
+	}
+
+	affected, err := ormer.Engine.ID(core.PK{user.Owner, user.Name}).Where("password = ?", "").
+		Cols("password", "password_salt", "password_type", "last_change_password_time", "updated_time", "hash").Update(user)
+	if err != nil {
+		return false, err
+	}
+	return affected != 0, nil
 }
 
 func initBuiltInApplication() {
@@ -230,6 +316,7 @@ func initBuiltInApplication() {
 		},
 		SignupItems: []*SignupItem{
 			{Name: "ID", Visible: false, Required: true, Prompted: false, Rule: "Random"},
+			{Name: "Logo", Visible: true, Required: false, Prompted: false, Rule: "None"},
 			{Name: "Username", Visible: true, Required: true, Prompted: false, Rule: "None"},
 			{Name: "Display name", Visible: true, Required: true, Prompted: false, Rule: "None"},
 			{Name: "Password", Visible: true, Required: true, Prompted: false, Rule: "None"},
@@ -248,28 +335,13 @@ func initBuiltInApplication() {
 
 		CookieExpireInHours: 720,
 	}
-	_, err = AddApplication(application)
+	_, err = AddApplication(application, "en")
 	if err != nil {
 		panic(err)
 	}
 }
 
-func readTokenFromFile() (string, string) {
-	pemPath := "./object/token_jwt_key.pem"
-	keyPath := "./object/token_jwt_key.key"
-	pem, err := os.ReadFile(pemPath)
-	if err != nil {
-		return "", ""
-	}
-	key, err := os.ReadFile(keyPath)
-	if err != nil {
-		return "", ""
-	}
-	return string(pem), string(key)
-}
-
 func initBuiltInCert() {
-	tokenJwtCertificate, tokenJwtPrivateKey := readTokenFromFile()
 	cert, err := getCert("admin", "cert-built-in")
 	if err != nil {
 		panic(err)
@@ -279,6 +351,8 @@ func initBuiltInCert() {
 		return
 	}
 
+	// the Certificate and PrivateKey are left empty for AddCert() to generate a new key pair,
+	// the one used by the old versions is public in the repository
 	cert = &Cert{
 		Owner:           "admin",
 		Name:            "cert-built-in",
@@ -289,12 +363,26 @@ func initBuiltInCert() {
 		CryptoAlgorithm: "RS256",
 		BitSize:         4096,
 		ExpireInYears:   20,
-		Certificate:     tokenJwtCertificate,
-		PrivateKey:      tokenJwtPrivateKey,
 	}
 	_, err = AddCert(cert)
 	if err != nil {
 		panic(err)
+	}
+}
+
+// the SHA-256 of the private key that the old versions created cert-built-in with, it was published in the repository
+const publicBuiltInPrivateKeySha256 = "69cb4de40b4ffd09564cdad858a60f4666f0a9aa1d88331c97a5438ccef69012"
+
+func warnPublicBuiltInCert() {
+	cert, err := getCert("admin", "cert-built-in")
+	if err != nil || cert == nil {
+		return
+	}
+
+	privateKey := strings.TrimSpace(strings.ReplaceAll(cert.PrivateKey, "\r", ""))
+	hash := sha256.Sum256([]byte(privateKey))
+	if hex.EncodeToString(hash[:]) == publicBuiltInPrivateKeySha256 {
+		fmt.Printf("WARNING: the cert: %s signs tokens with the private key published in the Casdoor repository, anyone can forge its tokens, please generate a new key pair for it\n", cert.GetId())
 	}
 }
 
@@ -315,7 +403,7 @@ func initBuiltInLdap() {
 		Host:       "example.com",
 		Port:       389,
 		Username:   "cn=buildin,dc=example,dc=com",
-		Password:   "123",
+		Password:   "",
 		BaseDn:     "ou=BuildIn,dc=example,dc=com",
 		AutoSync:   0,
 		LastSync:   "",

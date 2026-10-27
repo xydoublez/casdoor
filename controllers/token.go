@@ -17,6 +17,8 @@ package controllers
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/beego/beego/v2/core/utils/pagination"
@@ -117,6 +119,10 @@ func (c *ApiController) UpdateToken() {
 		return
 	}
 
+	if !c.requireTokenPermission(&token, true) {
+		return
+	}
+
 	c.Data["json"] = wrapActionResponse(object.UpdateToken(id, &token, c.IsGlobalAdmin()))
 	c.ServeJSON()
 }
@@ -133,6 +139,10 @@ func (c *ApiController) AddToken() {
 	err := json.Unmarshal(c.Ctx.Input.RequestBody, &token)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+
+	if !c.requireTokenPermission(&token, true) {
 		return
 	}
 
@@ -155,8 +165,40 @@ func (c *ApiController) DeleteToken() {
 		return
 	}
 
+	if !c.requireTokenPermission(&token, false) {
+		return
+	}
+
 	c.Data["json"] = wrapActionResponse(object.DeleteToken(&token))
 	c.ServeJSON()
+}
+
+func (c *ApiController) requireTokenPermission(token *object.Token, checkApplication bool) bool {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if isGlobalAdmin {
+		return true
+	}
+
+	if user == nil || !user.IsAdmin || user.Owner != token.Organization {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
+		return false
+	}
+
+	if !checkApplication {
+		return true
+	}
+
+	application, err := object.GetApplication(util.GetId("admin", token.Application))
+	if err != nil {
+		c.ResponseError(err.Error())
+		return false
+	}
+	if application == nil || application.Organization != token.Organization {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
+		return false
+	}
+
+	return true
 }
 
 // GetOAuthToken
@@ -172,6 +214,9 @@ func (c *ApiController) DeleteToken() {
 // @Success 401 {object} object.TokenError The Response object
 // @router /login/oauth/access_token [post]
 func (c *ApiController) GetOAuthToken() {
+	c.Ctx.Output.Header("Cache-Control", "no-store")
+	c.Ctx.Output.Header("Pragma", "no-cache")
+
 	clientId := c.Ctx.Input.Query("client_id")
 	clientSecret := c.Ctx.Input.Query("client_secret")
 	assertion := c.Ctx.Input.Query("assertion")
@@ -184,6 +229,7 @@ func (c *ApiController) GetOAuthToken() {
 	nonce := c.Ctx.Input.Query("nonce")
 	username := c.Ctx.Input.Query("username")
 	password := c.Ctx.Input.Query("password")
+	countryCode := c.Ctx.Input.Query("country_code")
 	tag := c.Ctx.Input.Query("tag")
 	avatar := c.Ctx.Input.Query("avatar")
 	refreshToken := c.Ctx.Input.Query("refresh_token")
@@ -194,7 +240,7 @@ func (c *ApiController) GetOAuthToken() {
 	resource := c.Ctx.Input.Query("resource")
 
 	if clientId == "" && clientSecret == "" {
-		clientId, clientSecret, _ = c.Ctx.Request.BasicAuth()
+		clientId, clientSecret, _ = c.getClientBasicAuth()
 	}
 
 	if len(c.Ctx.Input.RequestBody) != 0 && grantType != "urn:ietf:params:oauth:grant-type:device_code" {
@@ -234,6 +280,9 @@ func (c *ApiController) GetOAuthToken() {
 			}
 			if password == "" {
 				password = tokenRequest.Password
+			}
+			if countryCode == "" {
+				countryCode = tokenRequest.CountryCode
 			}
 			if tag == "" {
 				tag = tokenRequest.Tag
@@ -347,7 +396,7 @@ func (c *ApiController) GetOAuthToken() {
 		return
 	}
 
-	token, err := object.GetOAuthToken(grantType, clientId, clientSecret, code, verifier, scope, nonce, username, password, host, refreshToken, tag, avatar, c.GetAcceptLanguage(), subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, dpopProof)
+	token, err := object.GetOAuthToken(grantType, clientId, clientSecret, code, verifier, scope, nonce, username, password, countryCode, host, refreshToken, tag, avatar, c.GetAcceptLanguage(), subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, dpopProof, util.GetClientIpFromRequest(c.Ctx.Request))
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
@@ -379,6 +428,9 @@ func (c *ApiController) GetOAuthToken() {
 // @Success 401 {object} object.TokenError The Response object
 // @router /login/oauth/refresh_token [post]
 func (c *ApiController) RefreshToken() {
+	c.Ctx.Output.Header("Cache-Control", "no-store")
+	c.Ctx.Output.Header("Pragma", "no-cache")
+
 	grantType := c.Ctx.Input.Query("grant_type")
 	refreshToken := c.Ctx.Input.Query("refresh_token")
 	scope := c.Ctx.Input.Query("scope")
@@ -402,13 +454,13 @@ func (c *ApiController) RefreshToken() {
 		}
 	}
 
-	ok, application, clientId, _, err := c.ValidateOAuth(true)
+	ok, application, clientId, clientSecret, err := c.ValidateOAuth(true)
 	if err != nil || !ok {
 		return
 	}
 
 	dpopProof := c.Ctx.Request.Header.Get("DPoP")
-	refreshToken2, err := object.RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, resource, host, dpopProof)
+	refreshToken2, err := object.RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, resource, host, dpopProof, "/api/login/oauth/refresh_token")
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
@@ -417,6 +469,64 @@ func (c *ApiController) RefreshToken() {
 	c.Data["json"] = refreshToken2
 	c.SetTokenErrorHttpStatus()
 	c.ServeJSON()
+}
+
+// RevokeToken
+// @Title RevokeToken
+// @Tag Login API
+// @Description revoke an OAuth access token or refresh token (RFC 7009), revoking a refresh token also revokes its access tokens
+// @Param   token     formData    string  true        "access_token's value or refresh_token's value"
+// @Param   token_type_hint     formData    string  false        "the token type access_token or refresh_token"
+// @Param   client_id     formData    string  false        "OAuth client id"
+// @Param   client_secret     formData    string  false        "OAuth client secret"
+// @Success 200 The token has been revoked or is unknown
+// @Success 400 {object} object.TokenError The Response object
+// @Success 401 {object} object.TokenError The Response object
+// @router /login/oauth/revoke [post]
+func (c *ApiController) RevokeToken() {
+	c.Ctx.Output.Header("Cache-Control", "no-store")
+	c.Ctx.Output.Header("Pragma", "no-cache")
+
+	tokenValue := c.Ctx.Input.Query("token")
+	tokenTypeHint := c.Ctx.Input.Query("token_type_hint")
+	clientId := c.Ctx.Input.Query("client_id")
+	clientSecret := c.Ctx.Input.Query("client_secret")
+	if clientId == "" && clientSecret == "" {
+		clientId, clientSecret, _ = c.getClientBasicAuth()
+	}
+
+	if clientId == "" {
+		c.ResponseTokenError(object.InvalidClient, "client_id is required")
+		return
+	}
+
+	application, err := object.GetApplicationByClientId(clientId)
+	if err != nil {
+		c.ResponseTokenError(object.InvalidClient, err.Error())
+		return
+	}
+	if application == nil || (clientSecret != "" && application.ClientSecret != clientSecret) {
+		c.ResponseTokenError(object.InvalidClient, c.T("token:Invalid application or wrong clientSecret"))
+		return
+	}
+
+	if tokenValue == "" {
+		c.ResponseTokenError(object.InvalidRequest, "token is required")
+		return
+	}
+
+	tokenError, err := object.RevokeToken(application, clientSecret, tokenValue, tokenTypeHint)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if tokenError != nil {
+		c.ResponseTokenError(tokenError.Error, tokenError.ErrorDescription)
+		return
+	}
+
+	c.Ctx.Output.SetStatus(http.StatusOK)
+	c.Ctx.Output.Body([]byte{})
 }
 
 func (c *ApiController) ResponseTokenError(errorMsg string, errorDescription string) {
@@ -445,7 +555,7 @@ func (c *ApiController) ValidateOAuth(ignoreValidSecret bool) (ok bool, applicat
 	}
 
 	if clientAssertionType == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
-		ok, application, err = object.ValidateClientAssertion(clientAssertion, c.Ctx.Request.Host)
+		ok, application, err = object.ValidateClientAssertion(clientAssertion, reqClientId, c.Ctx.Request.Host)
 		if err != nil {
 			c.ResponseTokenError(object.InvalidClient, err.Error())
 			return
@@ -463,7 +573,7 @@ func (c *ApiController) ValidateOAuth(ignoreValidSecret bool) (ok bool, applicat
 	}
 
 	if reqClientId == "" && reqClientSecret == "" {
-		clientId, clientSecret, ok = c.Ctx.Request.BasicAuth()
+		clientId, clientSecret, ok = c.getClientBasicAuth()
 		if !ok {
 			clientId = c.Ctx.Input.Query("client_id")
 			clientSecret = c.Ctx.Input.Query("client_secret")
@@ -532,12 +642,6 @@ func (c *ApiController) IntrospectToken() {
 			respondWithInactiveToken()
 			return
 		}
-
-		if token.ExpiresIn <= 0 {
-			c.Data["json"] = &object.IntrospectionResponse{Active: false}
-			c.ServeJSON()
-			return
-		}
 	}
 
 	var introspectionResponse object.IntrospectionResponse
@@ -545,9 +649,6 @@ func (c *ApiController) IntrospectToken() {
 	if application.TokenFormat == "JWT-Standard" {
 		jwtToken, err := object.ParseStandardJwtTokenByApplication(tokenValue, application)
 		if err != nil {
-			// and token revoked case. but we not implement
-			// TODO: 2022-03-03 add token revoked check, when we implemented the Token Revocation(rfc7009) Specs.
-			// refs: https://tools.ietf.org/html/rfc7009
 			respondWithInactiveToken()
 			return
 		}
@@ -568,9 +669,6 @@ func (c *ApiController) IntrospectToken() {
 	} else {
 		jwtToken, err := object.ParseJwtTokenByApplication(tokenValue, application)
 		if err != nil {
-			// and token revoked case. but we not implement
-			// TODO: 2022-03-03 add token revoked check, when we implemented the Token Revocation(rfc7009) Specs.
-			// refs: https://tools.ietf.org/html/rfc7009
 			respondWithInactiveToken()
 			return
 		}
@@ -642,4 +740,26 @@ func (c *ApiController) IntrospectToken() {
 
 	c.Data["json"] = introspectionResponse
 	c.ServeJSON()
+}
+
+// getClientBasicAuth reads client_secret_basic credentials. RFC 6749 2.3.1
+// form-urlencodes the client id and secret before they are put in the header;
+// a client that sends them unencoded keeps working.
+func (c *ApiController) getClientBasicAuth() (string, string, bool) {
+	clientId, clientSecret, ok := c.Ctx.Request.BasicAuth()
+	if !ok {
+		return "", "", false
+	}
+
+	decodedId, errId := url.QueryUnescape(clientId)
+	decodedSecret, errSecret := url.QueryUnescape(clientSecret)
+	if errId != nil || errSecret != nil || (decodedId == clientId && decodedSecret == clientSecret) {
+		return clientId, clientSecret, true
+	}
+
+	application, err := object.GetApplicationByClientId(clientId)
+	if err == nil && application != nil && application.ClientSecret == clientSecret {
+		return clientId, clientSecret, true
+	}
+	return decodedId, decodedSecret, true
 }

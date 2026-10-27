@@ -16,10 +16,13 @@ package routers
 
 import (
 	"compress/gzip"
-	"errors"
+	stdcontext "context"
+	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +31,7 @@ import (
 	"github.com/beego/beego/v2/core/logs"
 	"github.com/beego/beego/v2/server/web/context"
 	"github.com/casdoor/casdoor/conf"
+	"github.com/casdoor/casdoor/controllers"
 	"github.com/casdoor/casdoor/object"
 	"github.com/casdoor/casdoor/util"
 )
@@ -62,9 +66,30 @@ func getWebBuildFolder() string {
 	return defaultPath
 }
 
+// GetSwaggerFolder finds the swagger folder like getWebBuildFolder(), so an instance whose folder only has its own
+// conf, logs and files can serve the swagger of the shared Casdoor code on the same machine
+func GetSwaggerFolder() string {
+	path := "swagger"
+	if util.FileExist(filepath.Join(path, "swagger.json")) || frontendBaseDir == "" {
+		return path
+	}
+
+	candidates := []string{
+		filepath.Join(frontendBaseDir, "swagger"),
+		filepath.Join(filepath.Dir(frontendBaseDir), "casdoor", "swagger"),
+	}
+	for _, candidate := range candidates {
+		if util.FileExist(filepath.Join(candidate, "swagger.json")) {
+			return candidate
+		}
+	}
+
+	return path
+}
+
 func fastAutoSignin(ctx *context.Context) (string, error) {
 	userId := getSessionUser(ctx)
-	if userId == "" {
+	if userId == "" || isSessionExpired(ctx) {
 		return "", nil
 	}
 
@@ -76,7 +101,14 @@ func fastAutoSignin(ctx *context.Context) (string, error) {
 	nonce := ctx.Input.Query("nonce")
 	codeChallenge := ctx.Input.Query("code_challenge")
 	resource := ctx.Input.Query("resource")
-	if clientId == "" || responseType != "code" || redirectUri == "" {
+	responseMode := ctx.Input.Query("response_mode")
+	if clientId == "" || responseType != "code" || redirectUri == "" || (responseMode != "" && responseMode != "query") {
+		return "", nil
+	}
+
+	// prompt=login and an expired max_age need the user to enter credentials on the sign-in page
+	authTime, _ := ctx.Input.Session("authTime").(int64)
+	if !object.IsSessionAuthFresh(ctx.Input.Query("prompt"), ctx.Input.Query("max_age"), authTime) {
 		return "", nil
 	}
 
@@ -92,20 +124,19 @@ func fastAutoSignin(ctx *context.Context) (string, error) {
 		return "", nil
 	}
 
-	isAllowed, err := object.CheckLoginPermission(userId, application)
-	if err != nil {
-		return "", err
-	}
-
-	if !isAllowed {
-		return "", nil
-	}
-
 	user, err := object.GetUser(userId)
 	if err != nil {
 		return "", err
 	}
 	if user == nil {
+		return "", nil
+	}
+
+	isAllowed, err := isFastAutoSigninAllowed(ctx, user, application)
+	if err != nil {
+		return "", err
+	}
+	if !isAllowed {
 		return "", nil
 	}
 
@@ -118,19 +149,83 @@ func fastAutoSignin(ctx *context.Context) (string, error) {
 		return "", nil
 	}
 
-	code, err := object.GetOAuthCode(userId, clientId, "", "autoSignin", responseType, redirectUri, scope, state, nonce, codeChallenge, resource, ctx.Request.Host, getAcceptLanguage(ctx))
+	code, err := object.GetOAuthCode(userId, clientId, "", "autoSignin", responseType, redirectUri, scope, state, nonce, codeChallenge, resource, ctx.Input.CruSession.SessionID(stdcontext.Background()), authTime, ctx.Request.Host, getAcceptLanguage(ctx))
 	if err != nil {
 		return "", err
 	} else if code.Message != "" {
-		return "", errors.New(code.Message)
+		// the sign-in page reports why no code can be issued, and lets the user sign in with another account
+		return "", nil
 	}
 
 	sep := "?"
 	if strings.Contains(redirectUri, "?") {
 		sep = "&"
 	}
-	res := fmt.Sprintf("%s%scode=%s&state=%s", redirectUri, sep, code.Code, state)
+	issuer := object.GetOidcIssuer(ctx.Request.Host)
+	res := fmt.Sprintf("%s%scode=%s&state=%s&iss=%s", redirectUri, sep, url.QueryEscape(code.Code), url.QueryEscape(state), url.QueryEscape(issuer))
 	return res, nil
+}
+
+func isFastAutoSigninAllowed(ctx *context.Context, user *object.User, application *object.Application) (bool, error) {
+	if user.NeedUpdatePassword {
+		return false, nil
+	}
+
+	isRestricted, err := isRestrictedClientSession(ctx)
+	if err != nil || isRestricted {
+		return false, err
+	}
+
+	// signed in to Casdoor with an account of another organization: show the sign-in page of this application
+	isUserOfApplication, err := object.IsUserOfApplication(user, application)
+	if err != nil || !isUserOfApplication {
+		return false, err
+	}
+
+	err = object.CheckApplicationSignin(application, user, util.GetClientIpFromRequest(ctx.Request), getAcceptLanguage(ctx))
+	if err != nil {
+		return false, nil
+	}
+
+	organization, err := object.GetOrganizationByUser(user)
+	if err != nil {
+		return false, err
+	}
+	if object.IsNeedPromptMfa(organization, user) {
+		return false, nil
+	}
+
+	if user.Type == "paid-user" && !user.IsGlobalAdmin() && !user.IsAdmin {
+		return hasActiveSubscription(user)
+	}
+	return true, nil
+}
+
+func hasActiveSubscription(user *object.User) (bool, error) {
+	subscriptions, err := object.GetSubscriptionsByUser(user.Owner, user.Name)
+	if err != nil {
+		return false, err
+	}
+
+	for _, subscription := range subscriptions {
+		if subscription.State == object.SubStateActive {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func isSessionExpired(ctx *context.Context) bool {
+	session, ok := ctx.Input.Session("SessionData").(string)
+	if !ok {
+		return false
+	}
+
+	sessionData := &controllers.SessionData{}
+	if err := util.JsonToStruct(session, sessionData); err != nil {
+		return true
+	}
+	return sessionData.ExpireTime != 0 && sessionData.ExpireTime < time.Now().Unix()
 }
 
 func StaticFilter(ctx *context.Context) {
@@ -147,6 +242,9 @@ func StaticFilter(ctx *context.Context) {
 		return
 	}
 	if serveProviderHintRedirectScript(ctx) {
+		return
+	}
+	if serveWebManifest(ctx) {
 		return
 	}
 	if strings.HasPrefix(urlPath, "/cas") && (strings.HasSuffix(urlPath, "/serviceValidate") || strings.HasSuffix(urlPath, "/proxy") || strings.HasSuffix(urlPath, "/proxyValidate") || strings.HasSuffix(urlPath, "/validate") || strings.HasSuffix(urlPath, "/p3/serviceValidate") || strings.HasSuffix(urlPath, "/p3/proxyValidate") || strings.HasSuffix(urlPath, "/samlValidate")) {
@@ -193,7 +291,7 @@ func StaticFilter(ctx *context.Context) {
 		fmt.Println(err)
 	}
 
-	if strings.Contains(path, "/../") || !util.FileExist(path) {
+	if !filepath.IsLocal(strings.TrimPrefix(urlPath, "/")) || !util.FileExist(path) {
 		path = webBuildFolder + "/index.html"
 	}
 	if strings.HasSuffix(path, "/index.html") {
@@ -233,24 +331,53 @@ func serveFileWithReplace(w http.ResponseWriter, r *http.Request, name string, o
 		panic(err)
 	}
 
+	modTime := d.ModTime()
 	oldContent := util.ReadStringFromPath(name)
 	newContent := oldContent
 	if organizationThemeCookie != nil {
-		newContent = strings.ReplaceAll(newContent, "https://cdn.casbin.org/img/favicon.png", organizationThemeCookie.Favicon)
-		newContent = strings.ReplaceAll(newContent, "<title>Casdoor</title>", fmt.Sprintf("<title>%s</title>", organizationThemeCookie.DisplayName))
+		newContent = addBrandingToHtml(newContent, organizationThemeCookie)
 	}
 
 	// Set the correct <html lang="..."> on the initial HTML response so browsers
 	// do not mis-detect the page language (e.g. Chrome offering to translate a
 	// Chinese page into Chinese because the static shell declares lang="en").
 	if strings.HasSuffix(name, "index.html") {
+		w.Header().Set("Cache-Control", "no-cache")
 		lang := getIndexHtmlLanguage(r)
 		newContent = strings.ReplaceAll(newContent, `<html lang="en">`, fmt.Sprintf(`<html lang="%s">`, lang))
+		var cdnEnabled bool
+		newContent, cdnEnabled = useFrontendCdn(newContent, name, r)
+		if cdnEnabled {
+			// the same file is served with or without the CDN (cookie), so a 304 by modification time could bring back
+			// the cached CDN version after the page turned the CDN off
+			modTime = time.Time{}
+		}
+		newContent = addBasePathToHtml(newContent)
+		newContent = addWebConfigToHtml(newContent)
+		newContent = addIssuerToHtml(newContent, r.Host)
 	}
 
 	newContent = strings.ReplaceAll(newContent, oldStaticBaseUrl, newStaticBaseUrl)
 
-	http.ServeContent(w, r, d.Name(), d.ModTime(), strings.NewReader(newContent))
+	http.ServeContent(w, r, d.Name(), modTime, strings.NewReader(newContent))
+}
+
+// addWebConfigToHtml puts the web config into the page too: a page embedded in another site does not get the
+// jsonWebConfig cookie
+func addWebConfigToHtml(content string) string {
+	webConfig, err := json.Marshal(conf.GetWebConfig())
+	if err != nil {
+		return content
+	}
+
+	meta := fmt.Sprintf(`<meta name="casdoor-web-config" content="%s">`, html.EscapeString(string(webConfig)))
+	return strings.Replace(content, "</head>", meta+"</head>", 1)
+}
+
+// addIssuerToHtml tells the frontend the issuer it has to send back as `iss` in authorization responses (RFC 9207)
+func addIssuerToHtml(content string, host string) string {
+	meta := fmt.Sprintf(`<meta name="casdoor-issuer" content="%s">`, html.EscapeString(object.GetOidcIssuer(host)))
+	return strings.Replace(content, "</head>", meta+"</head>", 1)
 }
 
 type gzipResponseWriter struct {

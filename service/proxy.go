@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -36,7 +37,6 @@ func forwardHandler(targetUrl string, writer http.ResponseWriter, request *http.
 
 	if nil != err {
 		panic(err)
-		return
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
@@ -87,14 +87,12 @@ func forwardHandler(targetUrl string, writer http.ResponseWriter, request *http.
 		allowOrigin := resp.Header.Get("Access-Control-Allow-Origin")
 		allowCredentials := resp.Header.Get("Access-Control-Allow-Credentials")
 
-		// Remove CORS headers when the combination is present:
-		// 1. Access-Control-Allow-Credentials: true with Access-Control-Allow-Origin: *
-		//    This is actually blocked by browsers but we sanitize it anyway
-		// 2. Access-Control-Allow-Credentials: true with any origin
-		//    Without a configured allowlist, we cannot safely validate if the origin
-		//    is trusted or if it's being reflected from the request, so we remove all
-		//    CORS headers for credential-bearing responses to prevent theft
-		if strings.EqualFold(allowCredentials, "true") && allowOrigin != "" {
+		// Only "Allow-Credentials: true" together with a wildcard or "null" origin is
+		// unsafe, since it would let any site read credentialed responses. A concrete
+		// origin is the upstream's own allowlist decision (Casdoor validates it in
+		// CorsFilter), so it must be preserved, otherwise every cross-origin login
+		// through the proxy fails its preflight.
+		if strings.EqualFold(allowCredentials, "true") && (allowOrigin == "*" || strings.EqualFold(allowOrigin, "null")) {
 			// Remove CORS headers to prevent credential theft
 			resp.Header.Del("Access-Control-Allow-Origin")
 			resp.Header.Del("Access-Control-Allow-Credentials")
@@ -168,7 +166,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		responseError(w, "CasWAF error: site not found for host: %s", r.Host)
+		responseError(w, "Casdoor site error: site not found for host: %s", r.Host)
 		return
 	}
 
@@ -192,7 +190,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		responseError(w, "CasWAF error: ACME HTTP-01 challenge failed, requestUri cannot match with challengeMap, requestUri = %s, challengeMap = %v", r.RequestURI, challengeMap)
+		responseError(w, "Casdoor site error: ACME HTTP-01 challenge failed, requestUri cannot match with challengeMap, requestUri = %s, challengeMap = %v", r.RequestURI, challengeMap)
 		return
 	}
 
@@ -214,48 +212,58 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if !checkSiteRules(w, site, r) {
+		return
+	}
+
 	// oAuth proxy
 	if site.CasdoorApplication != "" {
-		// handle oAuth proxy
-		cookie, err := r.Cookie("casdoor_access_token")
-		if err != nil && err.Error() != "http: named cookie not present" {
-			panic(err)
-		}
+		clearUserHeaders(r)
 
-		casdoorClient, err := getCasdoorClientFromSite(site)
-		if err != nil {
-			responseError(w, "CasWAF error: getCasdoorClientFromSite() error: %s", err.Error())
-			return
-		}
-
-		if cookie == nil {
-			// not logged in
-			redirectToCasdoor(casdoorClient, w, r)
-			return
-		} else {
-			_, err = casdoorClient.ParseJwtToken(cookie.Value)
-			if err != nil {
-				responseError(w, "CasWAF error: casdoorClient.ParseJwtToken() error: %s", err.Error())
+		if !isSitePublicPath(site, r.URL) {
+			identity, result, msg := authenticateSiteRequest(site, r)
+			switch result {
+			case siteAuthNeedLogin:
+				casdoorClient, err := getCasdoorClientFromSite(site)
+				if err != nil {
+					responseError(w, "Casdoor site error: getCasdoorClientFromSite() error: %s", err.Error())
+					return
+				}
+				if _, err = r.Cookie("casdoor_access_token"); err == nil {
+					clearAccessTokenCookie(w)
+				}
+				redirectToCasdoor(casdoorClient, w, r)
+				return
+			case siteAuthForbidden:
+				responseForbidden(w, "Forbidden: %s", msg)
+				return
+			case siteAuthError:
+				responseError(w, "Casdoor site error: %s", msg)
 				return
 			}
+
+			setUserHeaders(r, identity)
 		}
 	}
 
 	host := site.GetHost()
 	if host == "" {
-		responseError(w, "CasWAF error: targetUrl should not be empty for host: %s, site = %v", r.Host, site)
+		responseError(w, "Casdoor site error: targetUrl should not be empty for host: %s, site = %v", r.Host, site)
 		return
 	}
 
+	nextHandle(w, r)
+}
+
+// evaluateSiteRules returns whether the request is allowed by the rules of the site, if not, the status code and message to respond.
+func evaluateSiteRules(site *object.Site, r *http.Request) (bool, int, string) {
 	if len(site.Rules) == 0 {
-		nextHandle(w, r)
-		return
+		return true, 0, ""
 	}
 
 	result, err := rule.CheckRules(site.Rules, r)
 	if err != nil {
-		responseError(w, "Internal Server Error: %v", err)
-		return
+		return false, http.StatusInternalServerError, fmt.Sprintf("Internal Server Error: %v", err)
 	}
 
 	reason := result.Reason
@@ -265,42 +273,79 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch result.Action {
 	case "", "Allow":
-		// Do not write header for Allow action, let the proxy handle it
+		return true, 0, ""
 	case "Block":
-		w.WriteHeader(result.StatusCode)
-		responseErrorWithoutCode(w, "Blocked by CasWAF: %s", reason)
-		return
+		return false, result.StatusCode, fmt.Sprintf("Blocked by Casdoor: %s", reason)
 	case "Drop":
-		w.WriteHeader(result.StatusCode)
-		responseErrorWithoutCode(w, "Dropped by CasWAF: %s", reason)
-		return
+		return false, result.StatusCode, fmt.Sprintf("Dropped by Casdoor: %s", reason)
 	default:
-		responseError(w, "Error in CasWAF: %s", reason)
+		return false, http.StatusInternalServerError, fmt.Sprintf("Casdoor site error: %s", reason)
 	}
-	nextHandle(w, r)
+}
+
+// checkSiteRules writes the response and returns false if the request is blocked by the rules of the site.
+func checkSiteRules(w http.ResponseWriter, site *object.Site, r *http.Request) bool {
+	isAllowed, statusCode, msg := evaluateSiteRules(site, r)
+	if !isAllowed {
+		w.WriteHeader(statusCode)
+		responseErrorWithoutCode(w, "%s", msg)
+	}
+	return isAllowed
+}
+
+// isSitePublicPath reports whether the path is one of the site's public paths or under one of them,
+// paths that aren't in the canonical form never count as public.
+func isSitePublicPath(site *object.Site, u *url.URL) bool {
+	if len(site.PublicPaths) == 0 {
+		return false
+	}
+
+	urlPath := u.Path
+	if !strings.HasPrefix(urlPath, "/") || u.RawPath != "" || strings.Contains(urlPath, "\\") {
+		return false
+	}
+	if cleanPath := path.Clean(urlPath); cleanPath != urlPath && cleanPath+"/" != urlPath {
+		return false
+	}
+
+	for _, publicPath := range site.PublicPaths {
+		publicPath = strings.TrimSpace(publicPath)
+		if !strings.HasPrefix(publicPath, "/") {
+			continue
+		}
+
+		publicPath = strings.TrimSuffix(publicPath, "/")
+		if publicPath == "" || urlPath == publicPath || strings.HasPrefix(urlPath, publicPath+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func nextHandle(w http.ResponseWriter, r *http.Request) {
 	site := getSiteByDomainWithWww(r.Host)
 	host := site.GetHost()
 	if site.SslMode == "Static Folder" {
-		var path string
-		if r.RequestURI != "/" {
-			path = filepath.Join(host, r.RequestURI)
-		} else {
-			path = filepath.Join(host, "/index.htm")
-			if !util.FileExist(path) {
-				path = filepath.Join(host, "/index.html")
-				if !util.FileExist(path) {
-					path = filepath.Join(host, r.RequestURI)
-				}
-			}
-		}
-		http.ServeFile(w, r, path)
+		http.ServeFile(w, r, getStaticFolderPath(host, r.URL.Path))
 	} else {
 		targetUrl := joinPath(site.GetHost(), r.RequestURI)
 		forwardHandler(targetUrl, w, r)
 	}
+}
+
+func getStaticFolderPath(folder string, urlPath string) string {
+	if urlPath != "/" {
+		return filepath.Join(folder, urlPath)
+	}
+
+	path := filepath.Join(folder, "/index.htm")
+	if !util.FileExist(path) {
+		path = filepath.Join(folder, "/index.html")
+		if !util.FileExist(path) {
+			path = filepath.Join(folder, urlPath)
+		}
+	}
+	return path
 }
 
 func Start() {
@@ -319,7 +364,7 @@ func Start() {
 	}
 
 	go func() {
-		fmt.Printf("CasWAF gateway running on: http://127.0.0.1:%d\n", gatewayHttpPort)
+		fmt.Printf("Casdoor site proxy running on: http://127.0.0.1:%d\n", gatewayHttpPort)
 		err := http.ListenAndServe(fmt.Sprintf(":%d", gatewayHttpPort), serverMux)
 		if err != nil {
 			logs.Error(err)
@@ -327,7 +372,7 @@ func Start() {
 	}()
 
 	go func() {
-		fmt.Printf("CasWAF gateway running on: https://127.0.0.1:%d\n", gatewayHttpsPort)
+		fmt.Printf("Casdoor site proxy running on: https://127.0.0.1:%d\n", gatewayHttpsPort)
 		server := &http.Server{
 			Handler: serverMux,
 			Addr:    fmt.Sprintf(":%d", gatewayHttpsPort),

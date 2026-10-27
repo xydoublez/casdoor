@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/util"
 	"github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/ssh"
@@ -31,37 +32,153 @@ type DatabaseSyncerProvider struct {
 	Syncer *Syncer
 }
 
+func (syncer *Syncer) isSshTunneled() bool {
+	return syncer.SshType != "" && (syncer.DatabaseType == "mysql" || syncer.DatabaseType == "postgres" || syncer.DatabaseType == "mssql")
+}
+
+func (syncer *Syncer) isDatabaseSyncer() bool {
+	switch GetSyncerProvider(syncer).(type) {
+	case *DatabaseSyncerProvider, *KeycloakSyncerProvider:
+		return true
+	}
+	return false
+}
+
+func CheckSyncerDatabaseHost(syncer *Syncer) error {
+	if !syncer.isDatabaseSyncer() || syncer.DatabaseType == "sqlite3" || syncer.DatabaseType == "sqlite" {
+		return nil
+	}
+	if syncer.isSshTunneled() {
+		if isTrustedDbHost(syncer.Organization, syncer.SshHost, syncer.SshPort) {
+			return nil
+		}
+		return util.CheckInternetHost(syncer.SshHost)
+	}
+	if isTrustedDbHost(syncer.Organization, syncer.Host, syncer.Port) {
+		return nil
+	}
+	return util.CheckInternetHost(syncer.Host)
+}
+
+func CheckSyncerDatabaseTarget(syncer *Syncer) error {
+	if !syncer.isDatabaseSyncer() {
+		return nil
+	}
+
+	for name, table := range map[string]string{"table": syncer.Table, "affiliation table": syncer.AffiliationTable} {
+		if table != "" && !isValidSyncerTable(table) {
+			return fmt.Errorf("the %s: %s of the syncer is not a valid table name", name, table)
+		}
+	}
+
+	if syncer.DatabaseType == "sqlite3" || syncer.DatabaseType == "sqlite" {
+		return nil
+	}
+	ownHost, ownPort, ok := getOwnDbAddress()
+	if !ok {
+		return nil
+	}
+	host := syncer.Host
+	if syncer.isSshTunneled() {
+		if !isSameDbServer(syncer.SshHost, 0, "localhost", 0) {
+			return nil
+		}
+	}
+	if !isCloudIntranet {
+		host = strings.ReplaceAll(host, "dbi.", "db.")
+		ownHost = strings.ReplaceAll(ownHost, "dbi.", "db.")
+	}
+	if !isSameDbServer(host, syncer.Port, ownHost, ownPort) {
+		return nil
+	}
+	if strings.EqualFold(syncer.Database, conf.GetConfigString("dbName")) {
+		return fmt.Errorf("the database: %s of the syncer is Casdoor's own database, which cannot be synced", syncer.Database)
+	}
+	if isTrustedDbHost(syncer.Organization, syncer.Host, syncer.Port) {
+		return nil
+	}
+	return fmt.Errorf("the host: %s:%d of the syncer is Casdoor's own database server, which cannot be synced", syncer.Host, syncer.Port)
+}
+
+func isValidSyncerTable(table string) bool {
+	parts := strings.Split(table, ".")
+	if len(parts) > 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !util.FilterSQLIdentifier(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func checkTenantSyncerHost(syncer *Syncer) error {
+	if syncer.Organization == "built-in" {
+		return nil
+	}
+	return CheckSyncerDatabaseHost(syncer)
+}
+
 // InitAdapter initializes the database adapter
 func (p *DatabaseSyncerProvider) InitAdapter() error {
 	if p.Syncer.Ormer != nil {
 		return nil
 	}
 
+	err := checkDataSourceFields(map[string]string{"host": p.Syncer.Host, "user": p.Syncer.User, "database": p.Syncer.Database, "SSL mode": p.Syncer.SslMode})
+	if err != nil {
+		return err
+	}
+
+	err = CheckSyncerDatabaseTarget(p.Syncer)
+	if err != nil {
+		return err
+	}
+
+	err = checkTenantSyncerHost(p.Syncer)
+	if err != nil {
+		return err
+	}
+
 	var dataSourceName string
 	if p.Syncer.DatabaseType == "mssql" {
-		dataSourceName = fmt.Sprintf("sqlserver://%s:%s@%s:%d?database=%s", p.Syncer.User, p.Syncer.Password, p.Syncer.Host, p.Syncer.Port, p.Syncer.Database)
+		dataSourceName = getMssqlDataSourceName(p.Syncer.User, p.Syncer.Password, p.Syncer.Host, p.Syncer.Port, p.Syncer.Database)
 	} else if p.Syncer.DatabaseType == "postgres" {
 		sslMode := "disable"
 		if p.Syncer.SslMode != "" {
 			sslMode = p.Syncer.SslMode
 		}
-		dataSourceName = fmt.Sprintf("user=%s password=%s host=%s port=%d sslmode=%s dbname=%s", p.Syncer.User, p.Syncer.Password, p.Syncer.Host, p.Syncer.Port, sslMode, p.Syncer.Database)
+		dataSourceName = fmt.Sprintf("user=%s password=%s host=%s port=%d sslmode=%s dbname=%s", p.Syncer.User, quotePostgresDataSourceValue(p.Syncer.Password), p.Syncer.Host, p.Syncer.Port, sslMode, p.Syncer.Database)
 	} else {
 		dataSourceName = fmt.Sprintf("%s:%s@tcp(%s:%d)/", p.Syncer.User, p.Syncer.Password, p.Syncer.Host, p.Syncer.Port)
 	}
 
 	var db *sql.DB
-	var err error
 
-	if p.Syncer.SshType != "" && (p.Syncer.DatabaseType == "mysql" || p.Syncer.DatabaseType == "postgres" || p.Syncer.DatabaseType == "mssql") {
+	if p.Syncer.isSshTunneled() {
 		var dial *ssh.Client
+		var sshHostKey string
 		if p.Syncer.SshType == "password" {
-			dial, err = DialWithPassword(p.Syncer.SshUser, p.Syncer.SshPassword, p.Syncer.SshHost, p.Syncer.SshPort)
+			dial, sshHostKey, err = DialWithPassword(p.Syncer.SshUser, p.Syncer.SshPassword, p.Syncer.SshHost, p.Syncer.SshPort, p.Syncer.SshHostKey)
 		} else {
-			dial, err = DialWithCert(p.Syncer.SshUser, p.Syncer.Owner+"/"+p.Syncer.Cert, p.Syncer.SshHost, p.Syncer.SshPort)
+			certOwner := p.Syncer.Organization
+			if certOwner == "" {
+				certOwner = p.Syncer.Owner
+			}
+			dial, sshHostKey, err = DialWithCert(p.Syncer.SshUser, util.GetId(certOwner, p.Syncer.Cert), p.Syncer.SshHost, p.Syncer.SshPort, p.Syncer.SshHostKey)
 		}
 		if err != nil {
 			return err
+		}
+
+		if strings.TrimSpace(p.Syncer.SshHostKey) == "" {
+			p.Syncer.SshHostKey = sshHostKey
+			err = updateSyncerSshHostKey(p.Syncer)
+			if err != nil {
+				dial.Close()
+				return err
+			}
 		}
 
 		// Store SSH client for proper cleanup

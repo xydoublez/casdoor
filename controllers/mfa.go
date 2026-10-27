@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/casdoor/casdoor/object"
@@ -44,6 +45,7 @@ func (c *ApiController) MfaSetupInitiate() {
 	MfaUtil := object.GetMfaUtil(mfaType, nil)
 	if MfaUtil == nil {
 		c.ResponseError("Invalid auth type")
+		return
 	}
 
 	user, err := object.GetUser(userId)
@@ -60,6 +62,11 @@ func (c *ApiController) MfaSetupInitiate() {
 	organization, err := object.GetOrganizationByUser(user)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+
+	if !object.IsMfaTypeAllowed(organization, user, mfaType) {
+		c.ResponseError(fmt.Sprintf("the MFA type: %s is not allowed by the MFA items", mfaType))
 		return
 	}
 
@@ -160,12 +167,49 @@ func (c *ApiController) MfaSetupVerify() {
 		return
 	}
 
-	err := mfaUtil.SetupVerify(passcode)
+	user, err := object.GetUser(util.GetId(c.Ctx.Request.Form.Get("owner"), c.Ctx.Request.Form.Get("name")))
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if user == nil {
+		c.ResponseError("User doesn't exist")
+		return
+	}
+
+	verifiedDest := getMfaSetupDest(mfaType, dest, countryCode)
+	err = object.VerifyMfaWithLimit(user, func() error { return mfaUtil.SetupVerify(passcode, c.GetAcceptLanguage()) }, c.GetAcceptLanguage())
 	if err != nil {
 		c.ResponseError(err.Error())
 	} else {
+		c.SetSession(mfaSetupVerifiedDestSession, verifiedDest)
 		c.ResponseOk(http.StatusText(http.StatusOK))
 	}
+}
+
+const mfaSetupVerifiedDestSession = "mfaSetupVerifiedDest"
+
+func getMfaSetupDest(mfaType string, dest string, countryCode string) string {
+	if mfaType == object.SmsType {
+		dest, _ = util.GetE164Number(dest, countryCode)
+	}
+	return mfaType + ":" + dest
+}
+
+func (c *ApiController) checkMfaSetupDest(user *object.User, mfaType string) bool {
+	if (mfaType != object.SmsType && mfaType != object.EmailType) || c.IsAdminOf(user) {
+		return true
+	}
+
+	dest := user.Email
+	if mfaType == object.SmsType {
+		dest = user.Phone
+	}
+	if c.GetSession(mfaSetupVerifiedDestSession) != getMfaSetupDest(mfaType, dest, user.CountryCode) {
+		c.ResponseError("the MFA destination has not been verified")
+		return false
+	}
+	return true
 }
 
 // MfaSetupEnable
@@ -264,12 +308,28 @@ func (c *ApiController) MfaSetupEnable() {
 		return
 	}
 
+	organization, err := object.GetOrganizationByUser(user)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
+	if !object.IsMfaTypeAllowed(organization, user, mfaType) {
+		c.ResponseError(fmt.Sprintf("the MFA type: %s is not allowed by the MFA items", mfaType))
+		return
+	}
+
+	if !c.checkMfaSetupDest(user, mfaType) {
+		return
+	}
+
 	err = mfaUtil.Enable(user)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
 	}
 
+	c.DelSession(mfaSetupVerifiedDestSession)
 	c.ResponseOk(http.StatusText(http.StatusOK))
 }
 

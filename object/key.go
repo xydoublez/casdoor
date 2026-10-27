@@ -146,10 +146,16 @@ func UpdateKey(id string, key *Key) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if k, err := getKey(owner, name); err != nil {
+	oldKey, err := getKey(owner, name)
+	if err != nil {
 		return false, err
-	} else if k == nil {
+	} else if oldKey == nil {
 		return false, nil
+	}
+
+	key.AccessKey, key.AccessSecret = oldKey.AccessKey, oldKey.AccessSecret
+	if key.AccessKey == "" || key.AccessSecret == "" {
+		key.AccessKey, key.AccessSecret = util.GenerateId(), util.GenerateId()
 	}
 
 	key.UpdatedTime = util.GetCurrentTime()
@@ -163,12 +169,8 @@ func UpdateKey(id string, key *Key) (bool, error) {
 }
 
 func AddKey(key *Key) (bool, error) {
-	if key.AccessKey == "" {
-		key.AccessKey = util.GenerateId()
-	}
-	if key.AccessSecret == "" {
-		key.AccessSecret = util.GenerateId()
-	}
+	key.AccessKey = util.GenerateId()
+	key.AccessSecret = util.GenerateId()
 
 	affected, err := ormer.Engine.Insert(key)
 	if err != nil {
@@ -189,6 +191,22 @@ func DeleteKey(key *Key) (bool, error) {
 
 func (key *Key) GetId() string {
 	return fmt.Sprintf("%s/%s", key.Owner, key.Name)
+}
+
+func (key *Key) IsUserActive() (bool, error) {
+	if key.User == "" {
+		return true, nil
+	}
+
+	user, err := getUser(key.Organization, key.User)
+	if err != nil {
+		return false, err
+	}
+	if user == nil {
+		return false, nil
+	}
+
+	return !user.IsForbidden && !user.IsDeleted, nil
 }
 
 // ValidateKeyByType checks whether the given accessKey/accessSecret pair refers to a

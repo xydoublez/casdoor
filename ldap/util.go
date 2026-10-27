@@ -56,7 +56,7 @@ var ldapAttributesMapping = map[string]FieldRelation{
 	"uid": {userField: "name", hideOnStarOp: true, fieldMapper: func(user *object.User) message.AttributeValue {
 		return message.AttributeValue(user.Name)
 	}},
-	"displayname": {userField: "displayName", fieldMapper: func(user *object.User) message.AttributeValue {
+	"displayName": {userField: "displayName", fieldMapper: func(user *object.User) message.AttributeValue {
 		return message.AttributeValue(user.DisplayName)
 	}},
 	"email": {userField: "email", fieldMapper: func(user *object.User) message.AttributeValue {
@@ -127,6 +127,19 @@ var ldapAttributesMapping = map[string]FieldRelation{
 
 const ldapMemberOfAttr = "memberOf"
 
+// userObjectClasses are carried by every published user entry: posixAccount for
+// Unix logins, the Samba ones for SMB clients such as Synology DSM and TrueNAS.
+var userObjectClasses = []string{"posixAccount", "sambaSamAccount", "sambaIdmapEntry"}
+
+func isUserObjectClass(objectClass string) bool {
+	for _, name := range userObjectClasses {
+		if strings.EqualFold(objectClass, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // syntheticUserAttribute is a POSIX attribute the LDAP server computes, so a
 // filter on it is finished in memory. column holds the assigned value, if any.
 type syntheticUserAttribute struct {
@@ -135,9 +148,14 @@ type syntheticUserAttribute struct {
 }
 
 var syntheticUserAttributes = map[string]syntheticUserAttribute{
-	"uidnumber":     {column: "uid_number", getValue: getUidNumber},
-	"gidnumber":     {column: "uid_number", getValue: getUidNumber},
-	"homedirectory": {getValue: getHomeDirectory},
+	"uidnumber":            {column: "uid_number", getValue: getUidNumber},
+	"gidnumber":            {column: "uid_number", getValue: getUidNumber},
+	"homedirectory":        {getValue: getHomeDirectory},
+	"sambasid":             {getValue: getSambaSid},
+	"sambaprimarygroupsid": {getValue: getSambaPrimaryGroupSid},
+	"sambaacctflags":       {getValue: getSambaAcctFlags},
+	"sambadomainname":      {getValue: func(user *object.User) string { return user.Owner }},
+	"sambapwdlastset":      {getValue: getSambaPwdLastSet},
 }
 
 // buildCoarseCondition keeps the rows that can still match: those the value is
@@ -209,36 +227,33 @@ func getNameAndOrgFromDN(DN string) (string, string, error) {
 }
 
 func getNameAndOrgFromFilter(baseDN, filter string) (string, string, int) {
-	if !strings.Contains(baseDN, "ou=") {
+	if !strings.Contains(strings.ToLower(baseDN), "ou=") {
 		return "", "", ldap.LDAPResultInvalidDNSyntax
 	}
 
 	name, org, err := getNameAndOrgFromDN(fmt.Sprintf("cn=%s,", getUsername(filter)) + baseDN)
 	if err != nil {
-		panic(err)
+		return "", "", ldap.LDAPResultInvalidDNSyntax
 	}
 
 	return name, org, ldap.LDAPResultSuccess
 }
 
 func getUsername(filter string) string {
-	nameIndex := strings.Index(filter, "cn=")
-	if nameIndex == -1 {
-		nameIndex = strings.Index(filter, "uid=")
-		if nameIndex == -1 {
-			return "*"
-		} else {
-			nameIndex += 4
+	for _, attr := range []string{"cn=", "uid="} {
+		for i := 0; i < len(filter); i++ {
+			if filter[i] != '(' || len(filter)-i-1 < len(attr) || !strings.EqualFold(filter[i+1:i+1+len(attr)], attr) {
+				continue
+			}
+			start := i + 1 + len(attr)
+			end := strings.IndexByte(filter[start:], ')')
+			if end == -1 {
+				return "*"
+			}
+			return filter[start : start+end]
 		}
-	} else {
-		nameIndex += 3
 	}
-
-	var name string
-	for i := nameIndex; filter[i] != ')'; i++ {
-		name = name + string(filter[i])
-	}
-	return name
+	return "*"
 }
 
 func stringInSlice(value string, list []string) bool {
@@ -250,9 +265,25 @@ func stringInSlice(value string, list []string) bool {
 	return false
 }
 
+var ldapPasswordAttrs = []string{"userPassword", "sambaNTPassword"}
+
+func isLdapPasswordAttr(attr string) bool {
+	for _, passwordAttr := range ldapPasswordAttrs {
+		if strings.EqualFold(attr, passwordAttr) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsLdapAttrAllowed checks whether the given LDAP attribute is allowed for the organization.
-// An empty filter or a filter containing "All" means all attributes are allowed.
+// An empty filter or a filter containing "All" means all attributes are allowed, except the
+// password attributes, which are only published when the organization enables them.
 func IsLdapAttrAllowed(org *object.Organization, attr string) bool {
+	if isLdapPasswordAttr(attr) && (org == nil || !org.EnableLdapPassword) {
+		return false
+	}
+
 	if org == nil || len(org.LdapAttributes) == 0 {
 		return true
 	}
@@ -339,7 +370,7 @@ func (q *userSearchFilter) buildCondition(filter interface{}, conjunctive bool) 
 	case message.FilterEqualityMatch:
 		attr := string(f.AttributeDesc())
 
-		if strings.EqualFold(attr, "objectclass") && strings.EqualFold(string(f.AssertionValue()), "posixAccount") {
+		if strings.EqualFold(attr, "objectclass") && isUserObjectClass(string(f.AssertionValue())) {
 			return builder.Expr("1 = 1"), nil
 		}
 
@@ -355,7 +386,7 @@ func (q *userSearchFilter) buildCondition(filter interface{}, conjunctive bool) 
 			return attribute.buildCoarseCondition(value), nil
 		}
 
-		if attr == ldapMemberOfAttr {
+		if strings.EqualFold(attr, ldapMemberOfAttr) {
 			var names []string
 			groupId := string(f.AssertionValue())
 			// Accept the DN form (cn=name,ou=owner,...) emitted by memberOf and
@@ -681,8 +712,20 @@ func getUserPasswordWithType(user *object.User) string {
 	return fmt.Sprintf("{%s}%s", prefix, user.Password)
 }
 
+func getLdapAttributeRelation(attributeName string) (FieldRelation, bool) {
+	if v, ok := ldapAttributesMapping[attributeName]; ok {
+		return v, true
+	}
+	for k, v := range ldapAttributesMapping {
+		if strings.EqualFold(k, attributeName) {
+			return v, true
+		}
+	}
+	return FieldRelation{}, false
+}
+
 func getAttribute(attributeName string, user *object.User) message.AttributeValue {
-	v, ok := ldapAttributesMapping[attributeName]
+	v, ok := getLdapAttributeRelation(attributeName)
 	if !ok {
 		return ""
 	}
@@ -690,7 +733,7 @@ func getAttribute(attributeName string, user *object.User) message.AttributeValu
 }
 
 func getUserFieldFromAttribute(attributeName string) (string, error) {
-	v, ok := ldapAttributesMapping[attributeName]
+	v, ok := getLdapAttributeRelation(attributeName)
 	if !ok {
 		return "", fmt.Errorf("attribute %s not supported", attributeName)
 	}

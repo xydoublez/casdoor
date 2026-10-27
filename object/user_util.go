@@ -15,6 +15,7 @@
 package object
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -54,6 +55,28 @@ func GetUserByField(organizationName string, field string, value string) (*User,
 	}
 }
 
+func GetUserByFieldIgnoreCase(organizationName string, field string, value string) (*User, error) {
+	if field == "" || value == "" {
+		return nil, nil
+	}
+
+	if !util.FilterSQLIdentifier(field) {
+		return nil, nil
+	}
+
+	user := User{Owner: organizationName}
+	existed, err := ormer.Engine.Where(fmt.Sprintf("lower(%s)=?", strings.ToLower(field)), strings.ToLower(value)).Get(&user)
+	if err != nil {
+		return nil, err
+	}
+
+	if existed {
+		return &user, nil
+	} else {
+		return nil, nil
+	}
+}
+
 func HasUserByField(organizationName string, field string, value string) bool {
 	user, err := GetUserByField(organizationName, field, value)
 	if err != nil {
@@ -62,16 +85,37 @@ func HasUserByField(organizationName string, field string, value string) bool {
 	return user != nil
 }
 
-func HasUserByPhoneAndCountryCode(organizationName string, phone string, countryCode string) bool {
+func GetUserByPhoneAndCountryCode(organizationName string, phone string, countryCode string) (*User, error) {
 	if phone == "" {
-		return false
+		return nil, nil
 	}
+
 	user := User{Owner: organizationName, Phone: phone, CountryCode: countryCode}
 	existed, err := ormer.Engine.Get(&user)
 	if err != nil {
+		return nil, err
+	}
+
+	if existed {
+		return &user, nil
+	} else {
+		return nil, nil
+	}
+}
+
+func HasUserByPhoneAndCountryCode(organizationName string, phone string, countryCode string) bool {
+	user, err := GetUserByPhoneAndCountryCode(organizationName, phone, countryCode)
+	if err != nil {
 		panic(err)
 	}
-	return existed
+	return user != nil
+}
+
+func GetUserByName(organization string, name string) (*User, error) {
+	if conf.GetConfigBool("isUsernameLowered") {
+		name = strings.ToLower(name)
+	}
+	return GetUserByField(organization, "name", strings.TrimSpace(name))
 }
 
 func GetUserByFields(organization string, field string) (*User, error) {
@@ -115,6 +159,11 @@ func GetUserByFields(organization string, field string) (*User, error) {
 		if user != nil || err != nil {
 			return user, err
 		}
+
+		user, err = getUserByNationalPhone(organization, field)
+		if user != nil || err != nil {
+			return user, err
+		}
 	}
 
 	// check user ID
@@ -127,6 +176,37 @@ func GetUserByFields(organization string, field string) (*User, error) {
 	user, err = GetUserByField(organization, "id_card", field)
 	if user != nil || err != nil {
 		return user, err
+	}
+
+	return nil, nil
+}
+
+// getUserByNationalPhone matches a phone number typed in the national format (e.g. "0796488996")
+// against the normalized number stored at signup, trying each country code of the organization.
+func getUserByNationalPhone(organization string, phone string) (*User, error) {
+	if phone == "" || strings.ContainsAny(phone, "@+") {
+		return nil, nil
+	}
+
+	org, err := getOrganization("admin", organization)
+	if err != nil || org == nil {
+		return nil, err
+	}
+
+	for _, countryCode := range org.CountryCodes {
+		if countryCode == "" || countryCode == "All" {
+			continue
+		}
+
+		normalizedPhone, normalizedCountryCode, ok := util.GetNormalizedPhone(phone, countryCode)
+		if !ok || normalizedPhone == phone {
+			continue
+		}
+
+		user, err := GetUserByPhoneAndCountryCode(organization, normalizedPhone, normalizedCountryCode)
+		if user != nil || err != nil {
+			return user, err
+		}
 	}
 
 	return nil, nil
@@ -526,10 +606,56 @@ func userVisible(isAdmin bool, item *AccountItem) bool {
 	return true
 }
 
+// adminOnlyAccountItems grant access or lift a restriction, an organization whose account items
+// leave one of them out must not hand it to its users
+var adminOnlyAccountItems = []string{"User type", "Tag", "Properties", "Groups", "Need update password", "IP whitelist"}
+
+func GetAccountItemForUpdate(name string, organization *Organization) *AccountItem {
+	item := GetAccountItemByName(name, organization)
+	if item == nil && util.InSlice(adminOnlyAccountItems, name) {
+		return &AccountItem{Name: name, ViewRule: "Admin", ModifyRule: "Admin"}
+	}
+	return item
+}
+
+func restoreAdminOnlyUserFields(oldUser, newUser *User) {
+	newUser.MfaPhoneEnabled = oldUser.MfaPhoneEnabled
+	newUser.MfaEmailEnabled = oldUser.MfaEmailEnabled
+	newUser.MfaItems = oldUser.MfaItems
+	newUser.MfaRememberDeadline = oldUser.MfaRememberDeadline
+	newUser.SigninWrongTimes = oldUser.SigninWrongTimes
+	newUser.LastSigninWrongTime = oldUser.LastSigninWrongTime
+	newUser.LastChangePasswordTime = oldUser.LastChangePasswordTime
+	newUser.RegisterType = oldUser.RegisterType
+	newUser.RegisterSource = oldUser.RegisterSource
+	newUser.WebauthnCredentials = getKeptWebauthnCredentials(oldUser.WebauthnCredentials, newUser.WebauthnCredentials)
+}
+
+func getKeptWebauthnCredentials(oldCredentials, newCredentials []webauthn.Credential) []webauthn.Credential {
+	if newCredentials == nil {
+		return oldCredentials
+	}
+
+	res := []webauthn.Credential{}
+	for _, oldCredential := range oldCredentials {
+		for _, newCredential := range newCredentials {
+			if bytes.Equal(oldCredential.ID, newCredential.ID) {
+				res = append(res, oldCredential)
+				break
+			}
+		}
+	}
+	return res
+}
+
 func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDisplayNameEmpty bool, lang string) (bool, string) {
 	organization, err := GetOrganizationByUser(oldUser)
 	if err != nil {
 		return false, err.Error()
+	}
+
+	if !isAdmin {
+		restoreAdminOnlyUserFields(oldUser, newUser)
 	}
 
 	var itemsChanged []*AccountItem
@@ -579,7 +705,7 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 		}
 	}
 	if oldUser.Type != newUser.Type {
-		item := GetAccountItemByName("User type", organization)
+		item := GetAccountItemForUpdate("User type", organization)
 		if !userVisible(isAdmin, item) {
 			newUser.Type = oldUser.Type
 		} else {
@@ -668,7 +794,7 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 		}
 	}
 	if oldUser.Tag != newUser.Tag {
-		item := GetAccountItemByName("Tag", organization)
+		item := GetAccountItemForUpdate("Tag", organization)
 		if !userVisible(isAdmin, item) {
 			newUser.Tag = oldUser.Tag
 		} else {
@@ -822,7 +948,7 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 	}
 	newUserPropertiesJson, _ := json.Marshal(newUser.Properties)
 	if string(oldUserPropertiesJson) != string(newUserPropertiesJson) {
-		item := GetAccountItemByName("Properties", organization)
+		item := GetAccountItemForUpdate("Properties", organization)
 		if !userVisible(isAdmin, item) {
 			newUser.Properties = oldUser.Properties
 		} else {
@@ -849,7 +975,7 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 	}
 	newUserGroupsJson, _ := json.Marshal(newUser.Groups)
 	if string(oldUserGroupsJson) != string(newUserGroupsJson) {
-		item := GetAccountItemByName("Groups", organization)
+		item := GetAccountItemForUpdate("Groups", organization)
 		if !userVisible(isAdmin, item) {
 			newUser.Groups = oldUser.Groups
 		} else {
@@ -910,7 +1036,7 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 		}
 	}
 	if oldUser.NeedUpdatePassword != newUser.NeedUpdatePassword {
-		item := GetAccountItemByName("Need update password", organization)
+		item := GetAccountItemForUpdate("Need update password", organization)
 		if !userVisible(isAdmin, item) {
 			newUser.NeedUpdatePassword = oldUser.NeedUpdatePassword
 		} else {
@@ -918,7 +1044,7 @@ func CheckPermissionForUpdateUser(oldUser, newUser *User, isAdmin bool, allowDis
 		}
 	}
 	if oldUser.IpWhitelist != newUser.IpWhitelist {
-		item := GetAccountItemByName("IP whitelist", organization)
+		item := GetAccountItemForUpdate("IP whitelist", organization)
 		if !userVisible(isAdmin, item) {
 			newUser.IpWhitelist = oldUser.IpWhitelist
 		} else {
@@ -1008,6 +1134,52 @@ func IsAppUser(userId string) bool {
 		return true
 	}
 	return false
+}
+
+// GetAppUser returns the virtual user an application credential ("app/<name>") acts as:
+// an admin of the application's organization, hence a global admin only when the
+// application belongs to the built-in organization. It returns nil when userId is not
+// such an app user or the application doesn't exist. A dynamically registered client
+// ("app-dcr/<name>") is created by anyone, so it never acts as an admin.
+func GetAppUser(userId string) (*User, error) {
+	if !strings.HasPrefix(userId, "app/") {
+		return nil, nil
+	}
+
+	_, name := util.GetOwnerAndNameFromIdNoCheck(userId)
+	application, err := getAppUserApplication(name)
+	if err != nil || application == nil || application.IsDynamicClient() {
+		return nil, err
+	}
+
+	return &User{Owner: application.Organization, Name: userId, IsAdmin: true}, nil
+}
+
+func getAppUserApplication(name string) (*Application, error) {
+	if realName, _ := util.GetSharedOrgFromApp(name); realName != name {
+		return nil, nil
+	}
+	return getApplication("admin", name)
+}
+
+func (application *Application) IsDynamicClient() bool {
+	return util.InSlice(application.Tags, "dcr") || util.InSlice(application.Tags, cimdTag)
+}
+
+func GetAppUserId(application *Application) string {
+	if application.IsDynamicClient() {
+		return fmt.Sprintf("app-dcr/%s", application.Name)
+	}
+	return fmt.Sprintf("app/%s", application.Name)
+}
+
+// GetUserOrAppUser returns the real user for userId, or the virtual user of an
+// application credential, see GetAppUser().
+func GetUserOrAppUser(userId string) (*User, error) {
+	if IsAppUser(userId) {
+		return GetAppUser(userId)
+	}
+	return GetUser(userId)
 }
 
 func setReflectAttr[T any](fieldValue *reflect.Value, fieldString string) error {
@@ -1146,6 +1318,7 @@ func replaceAttributeValue(user *User, value string) []string {
 
 	valueList = replaceAttributeValues("$user.owner", user.Owner, valueList)
 	valueList = replaceAttributeValues("$user.name", user.Name, valueList)
+	valueList = replaceAttributeValues("$user.displayName", user.DisplayName, valueList)
 	valueList = replaceAttributeValues("$user.email", user.Email, valueList)
 	valueList = replaceAttributeValues("$user.id", user.Id, valueList)
 	valueList = replaceAttributeValues("$user.phone", user.Phone, valueList)

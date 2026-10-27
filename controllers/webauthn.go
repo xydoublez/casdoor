@@ -94,6 +94,7 @@ func (c *ApiController) WebAuthnSignupFinish() {
 		c.ResponseError(c.T("webauthn:Please call WebAuthnSigninBegin first"))
 		return
 	}
+	c.DelSession("registration")
 	c.Ctx.Request.Body = io.NopCloser(bytes.NewBuffer(c.Ctx.Input.RequestBody))
 
 	credential, err := webauthnObj.FinishRegistration(user, sessionData, c.Ctx.Request)
@@ -185,9 +186,11 @@ func (c *ApiController) WebAuthnSigninFinish() {
 		c.ResponseError(c.T("webauthn:Please call WebAuthnSigninBegin first"))
 		return
 	}
+	c.DelSession("authentication")
 	c.Ctx.Request.Body = io.NopCloser(bytes.NewBuffer(c.Ctx.Input.RequestBody))
 
 	var user *object.User
+	var credential *webauthn.Credential
 	if sessionData.UserID != nil {
 		userId := string(sessionData.UserID)
 		user, err = object.GetUser(userId)
@@ -196,7 +199,7 @@ func (c *ApiController) WebAuthnSigninFinish() {
 			return
 		}
 
-		_, err = webauthnObj.FinishLogin(user, sessionData, c.Ctx.Request)
+		credential, err = webauthnObj.FinishLogin(user, sessionData, c.Ctx.Request)
 	} else {
 		handler := func(rawID, userHandle []byte) (webauthn.User, error) {
 			user, err = object.GetUserByWebauthID(base64.StdEncoding.EncodeToString(rawID))
@@ -206,23 +209,15 @@ func (c *ApiController) WebAuthnSigninFinish() {
 			return user, nil
 		}
 
-		_, err = webauthnObj.FinishDiscoverableLogin(handler, sessionData, c.Ctx.Request)
+		credential, err = webauthnObj.FinishDiscoverableLogin(handler, sessionData, c.Ctx.Request)
 	}
 
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
 	}
-	c.SetSessionUsername(user.GetId())
-	util.LogInfo(c.Ctx, "API: [%s] signed in", user.GetId())
 
-	var application *object.Application
-
-	if clientId != "" && (responseType == ResponseTypeCode) {
-		application, err = object.GetApplicationByClientId(clientId)
-	} else {
-		application, err = object.GetApplicationByUser(user)
-	}
+	application, err := getWebAuthnSigninApplication(clientId, responseType, c.Ctx.Input.Query("application"), user)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
@@ -231,10 +226,45 @@ func (c *ApiController) WebAuthnSigninFinish() {
 		c.ResponseError(c.T("check:Application does not exist"))
 		return
 	}
+	if !application.IsWebAuthnEnabled() {
+		c.ResponseError(c.T("auth:The login method: login with WebAuthn is not enabled for the application"))
+		return
+	}
+
+	if !credential.Flags.UserVerified && c.checkWebAuthnSigninMfa(user) {
+		return
+	}
 
 	var authForm form.AuthForm
 	authForm.Type = responseType
 	resp := c.HandleLoggedIn(application, user, &authForm)
+	if resp == nil {
+		return
+	}
+	if resp.Status == "ok" {
+		c.SetSessionUsername(user.GetId())
+		util.LogInfo(c.Ctx, "API: [%s] signed in", user.GetId())
+	}
 	c.Data["json"] = resp
 	c.ServeJSON()
+}
+
+func getWebAuthnSigninApplication(clientId string, responseType string, applicationName string, user *object.User) (*object.Application, error) {
+	if clientId != "" && responseType == ResponseTypeCode {
+		return object.GetApplicationByClientId(clientId)
+	}
+	if applicationName != "" {
+		return object.GetApplication(util.GetId("admin", applicationName))
+	}
+	return object.GetApplicationByUser(user)
+}
+
+func (c *ApiController) checkWebAuthnSigninMfa(user *object.User) bool {
+	organization, err := object.GetOrganizationByUser(user)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return true
+	}
+
+	return checkMfaEnable(c, user, organization, "")
 }

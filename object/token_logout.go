@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/casdoor/casdoor/util"
@@ -64,17 +63,11 @@ func generateLogoutToken(application *Application, user *User, sessionId string,
 		return "", fmt.Errorf("no cert found for application: %s", application.GetId())
 	}
 
-	var (
-		token *jwt.Token
-		key   interface{}
-	)
-
-	signingMethod := application.TokenSigningMethod
-	if strings.Contains(signingMethod, "ES") {
-		token = jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	var key interface{}
+	token := jwt.NewWithClaims(getJwtSigningMethod(application), claims)
+	if _, ok := token.Method.(*jwt.SigningMethodECDSA); ok {
 		key, err = jwt.ParseECPrivateKeyFromPEM([]byte(cert.PrivateKey))
 	} else {
-		token = jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 		key, err = jwt.ParseRSAPrivateKeyFromPEM([]byte(cert.PrivateKey))
 	}
 	if err != nil {
@@ -94,6 +87,17 @@ func SendBackchannelLogout(organization, username, sessionId, host string) {
 		return
 	}
 
+	user, err := GetUser(util.GetId(organization, username))
+	if err != nil || user == nil {
+		return
+	}
+
+	sendBackchannelLogoutForTokens(user, tokens, sessionId, host)
+}
+
+// sendBackchannelLogoutForTokens is the body of SendBackchannelLogout for callers that already
+// hold the user and its active tokens, so that the token table is not queried a second time
+func sendBackchannelLogoutForTokens(user *User, tokens []*Token, sessionId string, host string) {
 	// Deduplicate applications
 	seen := map[string]bool{}
 	for _, token := range tokens {
@@ -108,25 +112,34 @@ func SendBackchannelLogout(organization, username, sessionId, host string) {
 			continue
 		}
 
-		user, err := GetUser(util.GetId(organization, username))
-		if err != nil || user == nil {
-			continue
-		}
-
 		logoutToken, err := generateLogoutToken(application, user, sessionId, host)
 		if err != nil {
 			continue
 		}
 
-		go postBackchannelLogout(application.BackchannelLogoutUri, logoutToken)
+		go postLogoutForm(application, application.BackchannelLogoutUri, url.Values{"logout_token": {logoutToken}})
 	}
 }
 
-func postBackchannelLogout(logoutUri, logoutToken string) {
-	body := url.Values{"logout_token": {logoutToken}}
-	resp, err := http.PostForm(logoutUri, body)
+func postLogoutForm(application *Application, logoutUrl string, form url.Values) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if application.Organization != "built-in" {
+		client.Transport = util.NewNonLocalHttpTransport(30 * time.Second)
+	}
+
+	resp, err := client.PostForm(logoutUrl, form)
 	if err != nil {
+		fmt.Printf("postLogoutForm() error: %s\n", err.Error())
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Printf("postLogoutForm() error: unexpected status: %s from: %s\n", resp.Status, logoutUrl)
+	}
 }

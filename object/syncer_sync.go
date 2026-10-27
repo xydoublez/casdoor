@@ -17,7 +17,7 @@ package object
 import (
 	"fmt"
 
-	"github.com/casdoor/casdoor/util"
+	"github.com/xorm-io/core"
 )
 
 func (syncer *Syncer) syncUsers() error {
@@ -29,23 +29,11 @@ func (syncer *Syncer) syncUsers() error {
 
 	users, err := GetUsers(syncer.Organization)
 	if err != nil {
-		line := fmt.Sprintf("[%s] %s\n", util.GetCurrentTime(), err.Error())
-		_, err2 := updateSyncerErrorText(syncer, line)
-		if err2 != nil {
-			panic(err2)
-		}
-
 		return err
 	}
 
 	oUsers, err := syncer.getOriginalUsers()
 	if err != nil {
-		line := fmt.Sprintf("[%s] %s\n", util.GetCurrentTime(), err.Error())
-		_, err2 := updateSyncerErrorText(syncer, line)
-		if err2 != nil {
-			panic(err2)
-		}
-
 		return err
 	}
 
@@ -58,12 +46,6 @@ func (syncer *Syncer) syncUsers() error {
 		}
 		_, affiliationMap, err = syncer.getAffiliationMap()
 		if err != nil {
-			line := fmt.Sprintf("[%s] %s\n", util.GetCurrentTime(), err.Error())
-			_, err2 := updateSyncerErrorText(syncer, line)
-			if err2 != nil {
-				panic(err2)
-			}
-
 			return err
 		}
 	}
@@ -170,14 +152,42 @@ func (syncer *Syncer) syncUsers() error {
 				}
 			}
 		}
+	} else if len(oUsers) != 0 {
+		err = syncer.forbidRemovedUsers(users, myOUsers, key)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (syncer *Syncer) syncUsersNoError() {
-	err := syncer.syncUsers()
-	if err != nil {
-		fmt.Printf("syncUsersNoError() error: %s\n", err.Error())
+// forbidRemovedUsers forbids the users created by this syncer that no longer exist upstream
+func (syncer *Syncer) forbidRemovedUsers(users []*User, myOUsers map[string]*User, key string) error {
+	registerSource := fmt.Sprintf("%s/%s", syncer.Organization, syncer.Name)
+	for _, user := range users {
+		if user.IsForbidden || user.IsAdmin || user.RegisterType != "Add Users" || user.RegisterSource != registerSource {
+			continue
+		}
+
+		if _, ok := myOUsers[syncer.getUserValue(user, key)]; ok {
+			continue
+		}
+
+		fmt.Printf("Forbid user removed from oUsers: %s\n", user.GetId())
+		user.IsForbidden = true
+		user.Hash = ""
+		user.PreHash = ""
+		_, err := ormer.Engine.ID(core.PK{user.Owner, user.Name}).Cols("is_forbidden", "hash", "pre_hash").Update(user)
+		if err != nil {
+			return err
+		}
+
+		err = terminateUserAccess(user)
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }

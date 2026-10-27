@@ -17,6 +17,7 @@ package controllers
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/beego/beego/v2/core/utils/pagination"
 	"github.com/casdoor/casdoor/object"
@@ -88,6 +89,7 @@ func (c *ApiController) GetEnforcer() {
 		if loadModelCfg == "true" && enforcer.Model != "" {
 			err = enforcer.LoadModelCfg()
 			if err != nil {
+				c.ResponseError(err.Error())
 				return
 			}
 		}
@@ -114,6 +116,10 @@ func (c *ApiController) UpdateEnforcer() {
 		return
 	}
 
+	if !c.checkEnforcerReferences(&enforcer) {
+		return
+	}
+
 	c.Data["json"] = wrapActionResponse(object.UpdateEnforcer(id, &enforcer))
 	c.ServeJSON()
 }
@@ -130,6 +136,10 @@ func (c *ApiController) AddEnforcer() {
 	err := json.Unmarshal(c.Ctx.Input.RequestBody, &enforcer)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+
+	if !c.checkEnforcerReferences(&enforcer) {
 		return
 	}
 
@@ -243,6 +253,11 @@ func (c *ApiController) UpdatePolicy() {
 		return
 	}
 
+	if len(policies) < 2 {
+		c.ResponseError("The request body should contain at least two policies (old and new)")
+		return
+	}
+
 	affected, err := object.UpdatePolicy(id, policies[0].Ptype, util.CasbinToSlice(policies[0]), util.CasbinToSlice(policies[1]))
 	if err != nil {
 		c.ResponseError(err.Error())
@@ -304,4 +319,18 @@ func (c *ApiController) RemovePolicy() {
 	}
 	c.Data["json"] = wrapActionResponse(affected)
 	c.ServeJSON()
+}
+
+func (c *ApiController) checkEnforcerReferences(enforcer *object.Enforcer) bool {
+	if c.IsGlobalAdmin() {
+		return true
+	}
+
+	for _, id := range []string{enforcer.Model, enforcer.Adapter} {
+		if id != "" && !strings.HasPrefix(id, enforcer.Owner+"/") {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
+			return false
+		}
+	}
+	return true
 }

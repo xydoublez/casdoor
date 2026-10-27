@@ -30,6 +30,11 @@ func AutoSigninFilter(ctx *context.Context) {
 	if strings.HasPrefix(urlPath, "/api/login/oauth/access_token") {
 		return
 	}
+	// The RFC 7591/7592 DCR endpoints authenticate themselves: the bearer value is the
+	// application's "registration_access_token", which is not a row in the "token" table.
+	if strings.HasPrefix(urlPath, "/api/oauth/register") {
+		return
+	}
 	if urlPath == "/api/mcp" {
 		var req mcpself.McpRequest
 		if err := json.Unmarshal(ctx.Input.RequestBody, &req); err == nil {
@@ -50,6 +55,9 @@ func AutoSigninFilter(ctx *context.Context) {
 	}
 	if accessToken == "" {
 		accessToken = parseBearerToken(ctx)
+		if accessToken != "" {
+			skipSessionPersistence(ctx)
+		}
 	}
 
 	if accessToken != "" {
@@ -60,13 +68,13 @@ func AutoSigninFilter(ctx *context.Context) {
 		}
 
 		if token == nil {
-			responseError(ctx, "Access token doesn't exist in database")
+			responseInvalidToken(ctx, nil, "invalid_token", "Access token doesn't exist in database")
 			return
 		}
 
 		isExpired, expireTime := util.IsTokenExpired(token.CreatedTime, token.ExpiresIn)
 		if isExpired {
-			responseError(ctx, fmt.Sprintf("Access token has expired, expireTime = %s", expireTime))
+			responseInvalidToken(ctx, token, "invalid_token", fmt.Sprintf("Access token has expired, expireTime = %s", expireTime))
 			return
 		}
 
@@ -77,7 +85,7 @@ func AutoSigninFilter(ctx *context.Context) {
 			return
 		}
 		if !isUserActive {
-			responseError(ctx, "The user is forbidden to sign in, please contact the administrator")
+			responseInvalidToken(ctx, token, "invalid_token", "The user is forbidden to sign in, please contact the administrator")
 			return
 		}
 
@@ -85,17 +93,17 @@ func AutoSigninFilter(ctx *context.Context) {
 		if token.TokenType == "DPoP" {
 			dpopProof := ctx.Request.Header.Get("DPoP")
 			if dpopProof == "" {
-				responseError(ctx, "DPoP proof header required for DPoP-bound access token")
+				responseInvalidToken(ctx, token, "invalid_dpop_proof", "DPoP proof header required for DPoP-bound access token")
 				return
 			}
 			htu := object.GetDPoPHtu(ctx.Request.Host, ctx.Request.URL.Path)
 			jkt, dpopErr := object.ValidateDPoPProof(dpopProof, ctx.Request.Method, htu, accessToken)
 			if dpopErr != nil {
-				responseError(ctx, fmt.Sprintf("DPoP proof validation failed: %s", dpopErr.Error()))
+				responseInvalidToken(ctx, token, "invalid_dpop_proof", fmt.Sprintf("DPoP proof validation failed: %s", dpopErr.Error()))
 				return
 			}
 			if jkt != token.DPoPJkt {
-				responseError(ctx, "DPoP proof key binding mismatch")
+				responseInvalidToken(ctx, token, "invalid_token", "DPoP proof key binding mismatch")
 				return
 			}
 		}
@@ -112,12 +120,19 @@ func AutoSigninFilter(ctx *context.Context) {
 
 		var userId string
 		if token.GrantType == "client_credentials" {
-			userId = fmt.Sprintf("app/%s", token.Application)
+			userId = object.GetAppUserId(application)
 		} else {
 			userId = util.GetId(token.Organization, token.User)
 		}
+		setSessionSigninToken(ctx, userId, token)
 		setSessionUser(ctx, userId)
 		setSessionOidc(ctx, token.Scope, application.ClientId)
+		return
+	}
+
+	err := clearSessionOfRevokedToken(ctx)
+	if err != nil {
+		responseError(ctx, err.Error())
 		return
 	}
 
@@ -128,6 +143,7 @@ func AutoSigninFilter(ctx *context.Context) {
 		return
 	}
 	if userId != "" {
+		skipSessionPersistence(ctx)
 		setSessionUser(ctx, userId)
 		return
 	}
@@ -139,6 +155,7 @@ func AutoSigninFilter(ctx *context.Context) {
 		return
 	}
 	if userId != "" {
+		skipSessionPersistence(ctx)
 		setSessionUser(ctx, userId)
 		return
 	}
@@ -147,13 +164,7 @@ func AutoSigninFilter(ctx *context.Context) {
 	userId = ctx.Input.Query("username")
 	password := ctx.Input.Query("password")
 	if userId != "" && password != "" && ctx.Input.Query("grant_type") == "" {
-		owner, name, err := util.GetOwnerAndNameFromIdWithError(userId)
-		if err != nil {
-			responseError(ctx, err.Error())
-			return
-		}
-
-		_, err = object.CheckUserPassword(owner, name, password, "en")
+		err = checkUserPasswordWithoutMfa(userId, password, util.GetClientIpFromRequest(ctx.Request), getAcceptLanguage(ctx))
 		if err != nil {
 			responseError(ctx, err.Error())
 			return
@@ -161,4 +172,21 @@ func AutoSigninFilter(ctx *context.Context) {
 
 		setSessionUser(ctx, userId)
 	}
+}
+
+func checkUserPasswordWithoutMfa(userId string, password string, clientIp string, lang string) error {
+	owner, name, err := util.GetOwnerAndNameFromIdWithError(userId)
+	if err != nil {
+		return err
+	}
+
+	user, err := object.CheckUserPassword(owner, name, password, lang)
+	if err != nil {
+		return err
+	}
+
+	if user.IsMfaEnabled() {
+		return fmt.Errorf("the user: %s has MFA enabled and cannot sign in with a password in the URL", userId)
+	}
+	return object.CheckPasswordOnlySignin(user, clientIp, lang)
 }

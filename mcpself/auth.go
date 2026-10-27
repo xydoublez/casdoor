@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/object"
 	"github.com/casdoor/casdoor/util"
 )
@@ -86,8 +87,12 @@ func (c *McpController) isGlobalAdmin() (bool, *object.User) {
 	username := c.GetSessionUsername()
 
 	if object.IsAppUser(username) {
-		// e.g., "app/app-casnode"
-		return true, nil
+		// e.g., "app/app-casnode", an admin of the application's organization
+		appUser, err := object.GetAppUser(username)
+		if err != nil {
+			return false, nil
+		}
+		return appUser.IsGlobalAdmin(), appUser
 	}
 
 	user := c.getCurrentUser()
@@ -96,6 +101,11 @@ func (c *McpController) isGlobalAdmin() (bool, *object.User) {
 	}
 
 	return user.IsGlobalAdmin(), user
+}
+
+func (c *McpController) isOrganizationAllowed(organization string) bool {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	return isGlobalAdmin || (user != nil && user.Owner == organization)
 }
 
 func (c *McpController) getCurrentUser() *object.User {
@@ -115,11 +125,7 @@ func (c *McpController) getCurrentUser() *object.User {
 
 // GetAcceptLanguage returns the Accept-Language header value
 func (c *McpController) GetAcceptLanguage() string {
-	language := c.Ctx.Request.Header.Get("Accept-Language")
-	if len(language) > 2 {
-		language = language[0:2]
-	}
-	return language
+	return conf.GetAcceptLanguage(c.Ctx.Request.Header.Get("Accept-Language"))
 }
 
 // GetTokenFromRequest extracts the Bearer token from the Authorization header
@@ -171,6 +177,27 @@ func (c *McpController) GetClaimsFromToken() *object.Claims {
 	}
 
 	return claims
+}
+
+// GetSessionScopes returns the scopes of the access token that AutoSigninFilter signed this session in with.
+// The session outlives the bearer request, so a cookie-only request must stay bound to the same scopes.
+func (c *McpController) GetSessionScopes() ([]string, bool) {
+	scope, ok := c.GetSession("scope").(string)
+	if !ok {
+		return nil, false
+	}
+
+	return strings.Fields(scope), true
+}
+
+// GetGrantedScopes returns the scopes the request is limited to, and false if it is not scope-limited
+func (c *McpController) GetGrantedScopes() ([]string, bool) {
+	claims := c.GetClaimsFromToken()
+	if claims != nil {
+		return GetScopesFromClaims(claims), true
+	}
+
+	return c.GetSessionScopes()
 }
 
 // GetScopesFromClaims extracts the scopes from JWT claims and returns them as a slice

@@ -20,20 +20,24 @@ type WebConfig struct {
 	DefaultLanguage     string `json:"defaultLanguage"`
 	IsDemoMode          bool   `json:"isDemoMode"`
 	StaticBaseUrl       string `json:"staticBaseUrl"`
-	AiAssistantUrl      string `json:"aiAssistantUrl"`
 	DefaultApplication  string `json:"defaultApplication"`
 	MaxItemsForFlatMenu int64  `json:"maxItemsForFlatMenu"`
+	ThemeShowcase       bool   `json:"themeShowcase"`
+	MarketplaceUrl      string `json:"marketplaceUrl"`
 }
 
 func GetWebConfig() *WebConfig {
 	config := &WebConfig{}
 
 	config.ShowGithubCorner = GetConfigBool("showGithubCorner")
-	config.ForceLanguage = GetLanguage(GetConfigString("forceLanguage"))
+	// an empty forceLanguage means "don't force any language", it must not become "en"
+	config.ForceLanguage = GetConfigString("forceLanguage")
+	if config.ForceLanguage != "" {
+		config.ForceLanguage = GetLanguage(config.ForceLanguage)
+	}
 	config.DefaultLanguage = GetLanguage(GetConfigString("defaultLanguage"))
 	config.IsDemoMode = IsDemoMode()
 	config.StaticBaseUrl = GetConfigString("staticBaseUrl")
-	config.AiAssistantUrl = GetConfigString("aiAssistantUrl")
 	config.DefaultApplication = GetConfigString("defaultApplication")
 	if config.DefaultApplication == "" {
 		config.DefaultApplication = "app-built-in"
@@ -44,6 +48,11 @@ func GetWebConfig() *WebConfig {
 		maxItemsForFlatMenu = 7
 	}
 	config.MaxItemsForFlatMenu = maxItemsForFlatMenu
+
+	config.ThemeShowcase = GetConfigBool("themeShowcase") || IsDemoMode() || IsDemoDatabase()
+	if config.ThemeShowcase {
+		config.MarketplaceUrl = GetConfigString("marketplaceUrl")
+	}
 
 	return config
 }

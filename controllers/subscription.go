@@ -43,7 +43,7 @@ func (c *ApiController) GetSubscriptions() {
 		var subscriptions []*object.Subscription
 		var err error
 
-		if c.IsAdmin() {
+		if c.IsAdminOfOrganization(owner) {
 			// If field is "user", filter by that user even for admins
 			if field == "user" && value != "" {
 				subscriptions, err = object.GetSubscriptionsByUser(owner, value)
@@ -51,10 +51,8 @@ func (c *ApiController) GetSubscriptions() {
 				subscriptions, err = object.GetSubscriptions(owner)
 			}
 		} else {
-			user := c.GetSessionUsername()
-			_, userName, userErr := util.GetOwnerAndNameFromIdWithError(user)
-			if userErr != nil {
-				c.ResponseError(userErr.Error())
+			userName, ok := c.requireSessionUserNameOf(owner)
+			if !ok {
 				return
 			}
 			subscriptions, err = object.GetSubscriptionsByUser(owner, userName)
@@ -68,16 +66,29 @@ func (c *ApiController) GetSubscriptions() {
 		c.ResponseOk(subscriptions)
 	} else {
 		limit := util.ParseInt(limit)
-		if !c.IsAdmin() {
-			user := c.GetSessionUsername()
-			_, userName, userErr := util.GetOwnerAndNameFromIdWithError(user)
-			if userErr != nil {
-				c.ResponseError(userErr.Error())
+		if !c.IsAdminOfOrganization(owner) {
+			userName, ok := c.requireSessionUserNameOf(owner)
+			if !ok {
 				return
 			}
-			field = "user"
-			value = userName
+
+			count, err := object.GetSubscriptionCountByUser(owner, userName, field, value)
+			if err != nil {
+				c.ResponseError(err.Error())
+				return
+			}
+
+			paginator := pagination.NewPaginator(c.Ctx.Request, limit, count)
+			subscriptions, err := object.GetPaginationSubscriptionsByUser(owner, userName, paginator.Offset(), limit, field, value, sortField, sortOrder)
+			if err != nil {
+				c.ResponseError(err.Error())
+				return
+			}
+
+			c.ResponseOk(subscriptions, paginator.Nums())
+			return
 		}
+
 		count, err := object.GetSubscriptionCount(owner, field, value)
 		if err != nil {
 			c.ResponseError(err.Error())
@@ -111,6 +122,17 @@ func (c *ApiController) GetSubscription() {
 		return
 	}
 
+	if subscription != nil && !c.IsAdminOfOrganization(subscription.Owner) {
+		userName, ok := c.requireSessionUserNameOf(subscription.Owner)
+		if !ok {
+			return
+		}
+		if subscription.User != userName {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
+			return
+		}
+	}
+
 	c.ResponseOk(subscription)
 }
 
@@ -133,6 +155,43 @@ func (c *ApiController) UpdateSubscription() {
 	}
 
 	c.Data["json"] = wrapActionResponse(object.UpdateSubscription(id, &subscription))
+	c.ServeJSON()
+}
+
+// SetSubscriptionAutoRenew
+// @Title SetSubscriptionAutoRenew
+// @Tag Subscription API
+// @Description turn the auto renewal of a subscription on or off
+// @Param   id     query    string  true        "The id ( owner/name ) of the subscription"
+// @Param   autoRenew     query    string  true        "true or false"
+// @Success 200 {object} controllers.Response The Response object
+// @router /set-subscription-auto-renew [post]
+func (c *ApiController) SetSubscriptionAutoRenew() {
+	id := c.Ctx.Input.Query("id")
+	autoRenew := c.Ctx.Input.Query("autoRenew") == "true"
+
+	subscription, err := object.GetSubscription(id)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if subscription == nil {
+		c.ResponseError(fmt.Sprintf(c.T("auth:The subscription: %s does not exist"), id))
+		return
+	}
+
+	if !c.IsAdminOfOrganization(subscription.Owner) {
+		userName, ok := c.requireSessionUserNameOf(subscription.Owner)
+		if !ok {
+			return
+		}
+		if subscription.User == "" || subscription.User != userName {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
+			return
+		}
+	}
+
+	c.Data["json"] = wrapActionResponse(object.SetSubscriptionAutoRenew(subscription, autoRenew))
 	c.ServeJSON()
 }
 
@@ -159,14 +218,27 @@ func (c *ApiController) AddSubscription() {
 			return
 		}
 		if plan != nil && plan.IsExclusive {
-			hasSubscription, err := object.HasActiveSubscriptionForPlan(subscription.Owner, subscription.User, subscription.Plan)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
+			if subscription.User != "" {
+				hasSubscription, err := object.HasActiveSubscriptionForPlan(subscription.Owner, subscription.User, subscription.Plan)
+				if err != nil {
+					c.ResponseError(err.Error())
+					return
+				}
+				if hasSubscription {
+					c.ResponseError(fmt.Sprintf("User already has an active subscription for plan: %s", subscription.Plan))
+					return
+				}
 			}
-			if hasSubscription {
-				c.ResponseError(fmt.Sprintf("User already has an active subscription for plan: %s", subscription.Plan))
-				return
+			if subscription.Group != "" {
+				hasSubscription, err := object.HasActiveSubscriptionForPlanByGroup(subscription.Owner, subscription.Group, subscription.Plan)
+				if err != nil {
+					c.ResponseError(err.Error())
+					return
+				}
+				if hasSubscription {
+					c.ResponseError(fmt.Sprintf("Group already has an active subscription for plan: %s", subscription.Plan))
+					return
+				}
 			}
 		}
 	}

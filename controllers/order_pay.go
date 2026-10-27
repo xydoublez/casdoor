@@ -56,7 +56,7 @@ func (c *ApiController) PlaceOrder() {
 	var userId string
 	if paidUserName != "" {
 		userId = util.GetId(owner, paidUserName)
-		if userId != c.GetSessionUsername() && !c.IsAdmin() && userId != c.GetPaidUsername() {
+		if userId != c.GetSessionUsername() && !c.IsAdminOfOrganization(owner) && userId != c.GetPaidUsername() {
 			c.ResponseError(c.T("general:Only admin user can specify user"))
 			return
 		}
@@ -96,6 +96,7 @@ func (c *ApiController) PlaceOrder() {
 // @Description pay an existing order
 // @Param   id     query    string  true        "The id ( owner/name ) of the order"
 // @Param   providerName    query    string  true  "The name of the provider"
+// @Param   autoRenew    query    string  false  "Whether the subscriptions of the order renew automatically, the plan's default when empty"
 // @Success 200 {object} controllers.Response The Response object
 // @router /pay-order [post]
 func (c *ApiController) PayOrder() {
@@ -116,12 +117,18 @@ func (c *ApiController) PayOrder() {
 
 	userId := c.GetSessionUsername()
 	orderUserId := util.GetId(order.Owner, order.User)
-	if userId != orderUserId && !c.IsAdmin() {
+	if userId != orderUserId && !c.IsAdminOfOrganization(order.Owner) {
 		c.ResponseError(c.T("auth:Unauthorized operation"))
 		return
 	}
 
-	payment, attachInfo, err := object.PayOrder(providerName, host, paymentEnv, order, c.GetAcceptLanguage())
+	var autoRenew *bool
+	if autoRenewStr := c.Ctx.Input.Query("autoRenew"); autoRenewStr != "" {
+		value := autoRenewStr == "true"
+		autoRenew = &value
+	}
+
+	payment, attachInfo, err := object.PayOrder(providerName, host, paymentEnv, order, autoRenew, c.GetAcceptLanguage())
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
@@ -151,7 +158,7 @@ func (c *ApiController) CancelOrder() {
 
 	userId := c.GetSessionUsername()
 	orderUserId := util.GetId(order.Owner, order.User)
-	if userId != orderUserId && !c.IsAdmin() {
+	if userId != orderUserId && !c.IsAdminOfOrganization(order.Owner) {
 		c.ResponseError(c.T("auth:Unauthorized operation"))
 		return
 	}

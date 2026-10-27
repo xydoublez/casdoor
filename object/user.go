@@ -20,19 +20,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/casbin/casbin/v2"
 	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/faceId"
 	"github.com/casdoor/casdoor/i18n"
-	"github.com/casdoor/casdoor/proxy"
 	"github.com/casdoor/casdoor/util"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/xorm-io/builder"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 const (
@@ -196,8 +200,7 @@ type User struct {
 	Yammer          string `xorm:"yammer varchar(100)" json:"yammer"`
 	Yandex          string `xorm:"yandex varchar(100)" json:"yandex"`
 	Zoom            string `xorm:"zoom varchar(100)" json:"zoom"`
-	MetaMask        string `xorm:"metamask varchar(100)" json:"metamask"`
-	Web3Onboard     string `xorm:"web3onboard varchar(100)" json:"web3onboard"`
+	Oidc            string `xorm:"oidc varchar(100)" json:"oidc"`
 	Custom          string `xorm:"custom varchar(100)" json:"custom"`
 	Custom2         string `xorm:"custom2 text" json:"custom2"`
 	Custom3         string `xorm:"custom3 text" json:"custom3"`
@@ -252,21 +255,44 @@ type User struct {
 }
 
 type Userinfo struct {
-	Sub           string   `json:"sub"`
-	Iss           string   `json:"iss"`
-	Aud           string   `json:"aud"`
-	Name          string   `json:"preferred_username,omitempty"`
-	DisplayName   string   `json:"name,omitempty"`
-	Email         string   `json:"email,omitempty"`
-	EmailVerified bool     `json:"email_verified,omitempty"`
-	Avatar        string   `json:"picture,omitempty"`
-	Address       string   `json:"address,omitempty"`
-	Phone         string   `json:"phone,omitempty"`
-	RealName      string   `json:"real_name,omitempty"`
-	IsVerified    bool     `json:"is_verified,omitempty"`
-	Groups        []string `json:"groups,omitempty"`
-	Roles         []string `json:"roles,omitempty"`
-	Permissions   []string `json:"permissions,omitempty"`
+	Sub           string       `json:"sub"`
+	Iss           string       `json:"iss"`
+	Aud           string       `json:"aud"`
+	Name          string       `json:"preferred_username,omitempty"`
+	DisplayName   string       `json:"name,omitempty"`
+	Email         string       `json:"email,omitempty"`
+	EmailVerified bool         `json:"email_verified,omitempty"`
+	Avatar        string       `json:"picture,omitempty"`
+	Address       *OIDCAddress `json:"address,omitempty"`
+	Phone         string       `json:"phone,omitempty"`
+	PhoneNumber   string       `json:"phone_number,omitempty"`
+	RealName      string       `json:"real_name,omitempty"`
+	IsVerified    bool         `json:"is_verified,omitempty"`
+	Groups        []string     `json:"groups,omitempty"`
+	Roles         []string     `json:"roles,omitempty"`
+	Permissions   []string     `json:"permissions,omitempty"`
+
+	CustomClaims map[string]interface{} `json:"-"`
+}
+
+func (u Userinfo) MarshalJSON() ([]byte, error) {
+	type userinfo Userinfo
+	data, err := json.Marshal(userinfo(u))
+	if err != nil || len(u.CustomClaims) == 0 {
+		return data, err
+	}
+
+	res := map[string]interface{}{}
+	err = json.Unmarshal(data, &res)
+	if err != nil {
+		return nil, err
+	}
+	for name, value := range u.CustomClaims {
+		if _, ok := res[name]; !ok {
+			res[name] = value
+		}
+	}
+	return json.Marshal(res)
 }
 
 type ManagedAccount struct {
@@ -369,6 +395,11 @@ func GetUserCount(owner, field, value string, groupName string) (int64, error) {
 	return session.Count(&User{})
 }
 
+func GetUserCountWithFilter(owner string, cond builder.Cond) (int64, error) {
+	session := GetSession(owner, -1, -1, "", "", "", "")
+	return session.And(cond).Count(&User{})
+}
+
 func GetOnlineUserCount(owner string, isOnline int) (int64, error) {
 	return ormer.Engine.Where("is_online = ?", isOnline).Count(&User{Owner: owner})
 }
@@ -433,6 +464,16 @@ func GetPaginationUsers(owner string, offset, limit int, field, value, sortField
 
 	session := GetSessionForUser(owner, offset, limit, field, value, sortField, sortOrder)
 	err := session.Find(&users)
+	if err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+func GetPaginationUsersWithFilter(owner string, offset, limit int, cond builder.Cond) ([]*User, error) {
+	users := []*User{}
+	session := GetSession(owner, offset, limit, "", "", "", "")
+	err := session.And(cond).Find(&users)
 	if err != nil {
 		return nil, err
 	}
@@ -568,9 +609,27 @@ func GetUserByPhone(owner string, phone string) (*User, error) {
 
 	if existed {
 		return &user, nil
-	} else {
-		return nil, nil
 	}
+
+	if regionCode == "" {
+		return getUserByNationalPhone(owner, phone)
+	}
+	return nil, nil
+}
+
+// GetUserByPhoneWithCountryCode looks up the user of a phone number typed with the chosen country code,
+// a national number like "0796488996" is normalized the same way as the one stored at signup
+func GetUserByPhoneWithCountryCode(owner string, phone string, countryCode string) (*User, error) {
+	if countryCode != "" && !strings.HasPrefix(phone, "+") {
+		if e164, ok := util.GetE164Number(phone, countryCode); ok {
+			user, err := GetUserByPhone(owner, e164)
+			if user != nil || err != nil {
+				return user, err
+			}
+		}
+	}
+
+	return GetUserByPhone(owner, phone)
 }
 
 func GetUserByPhoneOnly(phone string) (*User, error) {
@@ -690,6 +749,7 @@ func GetMaskedUser(user *User, isAdminOrSelf bool, errs ...error) (*User, error)
 		if user.OriginalRefreshToken != "" {
 			user.OriginalRefreshToken = "***"
 		}
+		user.FaceIds = nil
 		// Mask per-provider OAuth tokens in Properties
 		if user.Properties != nil {
 			for key := range user.Properties {
@@ -699,6 +759,8 @@ func GetMaskedUser(user *User, isAdminOrSelf bool, errs ...error) (*User, error)
 				}
 			}
 		}
+		user.PasswordSalt = ""
+		user.PasswordType = ""
 	}
 
 	if user.ManagedAccounts != nil {
@@ -721,6 +783,22 @@ func GetMaskedUser(user *User, isAdminOrSelf bool, errs ...error) (*User, error)
 	}
 
 	return user, nil
+}
+
+func getOAuthDisplayProperties(properties map[string]string) map[string]string {
+	res := map[string]string{}
+	for key, value := range properties {
+		if !strings.HasPrefix(key, "oauth_") {
+			continue
+		}
+		for _, suffix := range []string{"_id", "_username", "_displayName", "_email", "_avatarUrl"} {
+			if strings.HasSuffix(key, suffix) {
+				res[key] = value
+				break
+			}
+		}
+	}
+	return res
 }
 
 func GetFilteredUser(user *User, isAdmin bool, isAdminOrSelf bool, accountItems []*AccountItem) (*User, error) {
@@ -766,6 +844,11 @@ func GetFilteredUser(user *User, isAdmin bool, isAdminOrSelf bool, accountItems 
 				}
 				continue
 			}
+		case "Properties":
+			if isAdminOrSelf {
+				user.Properties = getOAuthDisplayProperties(user.Properties)
+				continue
+			}
 		}
 
 		fieldIdx, ok := userFieldMap[lowerCaseAccountItemName]
@@ -808,6 +891,48 @@ func getLastUser(owner string) (*User, error) {
 	return nil, nil
 }
 
+var userSelfColumns = []string{
+	"owner", "display_name", "avatar", "first_name", "last_name",
+	"location", "address", "addresses", "country_code", "region", "language", "affiliation", "title", "id_card_type", "id_card", "homepage", "bio", "tag", "language", "gender", "birthday", "education", "score", "karma", "ranking", "signup_application", "register_type", "register_source",
+	"hash", "is_default_avatar", "properties", "webauthnCredentials", "mfa_items", "last_change_password_time", "managedAccounts", "face_ids", "mfaAccounts",
+	"signin_wrong_times", "last_signin_wrong_time", "groups", "mfa_phone_enabled", "mfa_email_enabled",
+	"type", "need_update_password", "ip_whitelist", "mfa_remember_deadline",
+	"cart", "application_scopes",
+}
+
+// userProviderColumns hold the IDs the sign-in by a provider looks the user up with, only the
+// link and unlink flows or an admin may set them, a user choosing their own would take over
+// the sign-in of whoever owns that provider account
+var userProviderColumns = []string{
+	"github", "google", "qq", "wechat", "facebook", "dingtalk", "weibo", "gitee", "linkedin", "wecom", "lark", "gitlab", "adfs",
+	"baidu", "alipay", "casdoor", "infoflow", "apple", "azuread", "azureadb2c", "slack", "steam", "bilibili", "okta", "douyin", "kwai", "line", "amazon",
+	"auth0", "battlenet", "bitbucket", "box", "cloudfoundry", "dailymotion", "deezer", "digitalocean", "discord", "dropbox",
+	"eveonline", "fitbit", "gitea", "heroku", "influxcloud", "instagram", "intercom", "kakao", "lastfm", "mailru", "meetup",
+	"microsoftonline", "naver", "nextcloud", "onedrive", "oura", "patreon", "paypal", "salesforce", "shopify", "soundcloud",
+	"spotify", "strava", "stripe", "telegram", "tiktok", "tumblr", "twitch", "twitter", "typetalk", "uber", "vk", "wepay", "xero", "yahoo",
+	"yammer", "yandex", "zoom", "oidc", "custom",
+}
+
+func GetDefaultUserUpdateColumns(isAdmin bool) []string {
+	columns := append([]string{}, userSelfColumns...)
+	if isAdmin {
+		columns = append(columns, "name", "id", "email", "phone", "country_code", "type", "balance", "balance_credit", "balance_currency", "mfa_items", "register_type", "register_source",
+			"is_admin", "is_forbidden", "is_deleted", "uid_number", "email_verified", "is_verified")
+		columns = append(columns, userProviderColumns...)
+	}
+	return columns
+}
+
+func FilterUserSelfColumns(columns []string) []string {
+	res := []string{}
+	for _, column := range columns {
+		if util.InSlice(userSelfColumns, column) {
+			res = append(res, column)
+		}
+	}
+	return res
+}
+
 func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, error) {
 	var err error
 	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
@@ -847,6 +972,10 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 		user.Password = oldUser.Password
 	}
 
+	if user.FaceIds == nil {
+		user.FaceIds = oldUser.FaceIds
+	}
+
 	if user.Id != oldUser.Id && user.Id == "" {
 		user.Id = oldUser.Id
 	}
@@ -859,25 +988,7 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	}
 
 	if len(columns) == 0 {
-		columns = []string{
-			"owner", "display_name", "avatar", "first_name", "last_name",
-			"location", "address", "addresses", "country_code", "region", "language", "affiliation", "title", "id_card_type", "id_card", "homepage", "bio", "tag", "language", "gender", "birthday", "education", "score", "karma", "ranking", "signup_application", "register_type", "register_source",
-			"hash", "is_default_avatar", "properties", "webauthnCredentials", "mfa_items", "last_change_password_time", "managedAccounts", "face_ids", "mfaAccounts",
-			"signin_wrong_times", "last_signin_wrong_time", "groups", "mfa_phone_enabled", "mfa_email_enabled", "email_verified",
-			"github", "google", "qq", "wechat", "facebook", "dingtalk", "weibo", "gitee", "linkedin", "wecom", "lark", "gitlab", "adfs",
-			"baidu", "alipay", "casdoor", "infoflow", "apple", "azuread", "azureadb2c", "slack", "steam", "bilibili", "okta", "douyin", "kwai", "line", "amazon",
-			"auth0", "battlenet", "bitbucket", "box", "cloudfoundry", "dailymotion", "deezer", "digitalocean", "discord", "dropbox",
-			"eveonline", "fitbit", "gitea", "heroku", "influxcloud", "instagram", "intercom", "kakao", "lastfm", "mailru", "meetup",
-			"microsoftonline", "naver", "nextcloud", "onedrive", "oura", "patreon", "paypal", "salesforce", "shopify", "soundcloud",
-			"spotify", "strava", "stripe", "type", "telegram", "tiktok", "tumblr", "twitch", "twitter", "typetalk", "uber", "vk", "wepay", "xero", "yahoo",
-			"yammer", "yandex", "zoom", "custom", "need_update_password", "ip_whitelist", "mfa_remember_deadline",
-			"cart", "application_scopes",
-		}
-
-		if isAdmin {
-			columns = append(columns, "name", "id", "email", "phone", "country_code", "type", "balance", "balance_credit", "balance_currency", "mfa_items", "register_type", "register_source",
-				"is_admin", "is_forbidden", "is_deleted", "uid_number")
-		}
+		columns = GetDefaultUserUpdateColumns(isAdmin)
 	}
 
 	columns = append(columns, "updated_time")
@@ -1006,7 +1117,9 @@ func AddUser(user *User, lang string) (bool, error) {
 		return false, errors.New(i18n.Translate(lang, "user:the user's owner and name should not be empty"))
 	}
 
-	if CheckUsernameWithEmail(user.Name, "en") != "" {
+	user.Groups = getOrganizationGroups(user.Owner, user.Groups)
+
+	if CheckUsernameWithEmail(user.Name, lang) != "" {
 		user.Name = util.GetRandomName()
 	}
 
@@ -1024,7 +1137,7 @@ func AddUser(user *User, lang string) (bool, error) {
 			return false, err
 		}
 		if applicationCount == 0 {
-			return false, fmt.Errorf(i18n.Translate(lang, "general:The organization: %s should have one application at least"), organization.Owner)
+			return false, fmt.Errorf(i18n.Translate(lang, "general:The organization: %s should have one application at least"), organization.Name)
 		}
 	}
 
@@ -1241,10 +1354,9 @@ func terminateUserAccess(user *User) error {
 		sessionIds = append(sessionIds, session.SessionId...)
 	}
 
-	// Send OIDC Back-Channel Logout notifications BEFORE expiring tokens,
-	// because SendBackchannelLogout calls GetActiveTokensByUser (expires_in > 0).
 	// The host is empty, so the issuer falls back to the configured origin
-	SendBackchannelLogout(user.Owner, user.Name, "", "")
+	sendBackchannelLogoutForTokens(user, tokens, "", "")
+	SendSamlLogout(user.Owner, user.Name, nil, "")
 
 	_, err = ExpireTokenByUser(user.Owner, user.Name)
 	if err != nil {
@@ -1284,17 +1396,30 @@ func DeleteUser(user *User) (bool, error) {
 		return false, err
 	}
 
+	err = DeletePasswordHistoryByUser(user.Owner, user.Name)
+	if err != nil {
+		return false, err
+	}
+
 	organization, err := GetOrganizationByUser(user)
 	if err != nil {
 		return false, err
 	}
 	if organization != nil && organization.EnableSoftDeletion {
-		user.IsDeleted = true
-		user.DeletedTime = util.GetCurrentTime()
-		return UpdateUser(user.GetId(), user, []string{"is_deleted", "deleted_time"}, false)
-	} else {
-		return deleteUser(user)
+		oldUser, err := getUser(user.Owner, user.Name)
+		if err != nil {
+			return false, err
+		}
+
+		// Deleting a user that is already soft-deleted removes it permanently
+		if oldUser != nil && !oldUser.IsDeleted {
+			user.IsDeleted = true
+			user.DeletedTime = util.GetCurrentTime()
+			return UpdateUser(user.GetId(), user, []string{"is_deleted", "deleted_time"}, false)
+		}
 	}
+
+	return deleteUser(user)
 }
 
 func GetUserInfo(user *User, scope string, aud string, host string) (*Userinfo, error) {
@@ -1337,7 +1462,11 @@ func GetUserInfo(user *User, scope string, aud string, host string) (*Userinfo, 
 			resp.Avatar = user.Avatar
 		}
 		if allowed("Groups") {
-			resp.Groups = user.Groups
+			groups, err := user.GetGroupsForToken(application)
+			if err != nil {
+				return nil, err
+			}
+			resp.Groups = groups
 		}
 
 		if allowed("Roles") || allowed("Permissions") {
@@ -1364,16 +1493,18 @@ func GetUserInfo(user *User, scope string, aud string, host string) (*Userinfo, 
 
 	if strings.Contains(scope, "email") && allowed("Email") {
 		resp.Email = user.Email
-		// resp.EmailVerified = user.EmailVerified
-		resp.EmailVerified = true
+		resp.EmailVerified = user.EmailVerified
 	}
 
 	if strings.Contains(scope, "address") && allowed("Location") {
-		resp.Address = user.Location
+		resp.Address = getOIDCAddress(user)
 	}
 
 	if strings.Contains(scope, "phone") && allowed("Phone") {
 		resp.Phone = user.Phone
+		if phoneNumber, ok := util.GetE164Number(user.Phone, user.CountryCode); ok {
+			resp.PhoneNumber = phoneNumber
+		}
 	}
 
 	if strings.Contains(scope, "profile") {
@@ -1383,6 +1514,20 @@ func GetUserInfo(user *User, scope string, aud string, host string) (*Userinfo, 
 		if allowed("IsVerified") {
 			resp.IsVerified = user.IsVerified
 		}
+	}
+
+	if application != nil && application.TokenFormat == "JWT-Custom" && len(application.TokenAttributes) > 0 {
+		tokenUser := *user
+		err = ExtendUserWithRolesAndPermissions(&tokenUser)
+		if err != nil {
+			return nil, err
+		}
+
+		refinedUser, err := getTokenUser(application, &tokenUser)
+		if err != nil {
+			return nil, err
+		}
+		resp.CustomClaims = getTokenAttributeClaims(refinedUser, application.TokenAttributes)
 	}
 
 	return &resp, nil
@@ -1430,8 +1575,16 @@ func (user *User) GetFriendlyName() string {
 	}
 }
 
-func isUserIdGlobalAdmin(userId string) bool {
-	return strings.HasPrefix(userId, "built-in/") || IsAppUser(userId)
+func isUserIdGlobalAdmin(userId string) (bool, error) {
+	if strings.HasPrefix(userId, "built-in/") {
+		return true, nil
+	}
+
+	appUser, err := GetAppUser(userId)
+	if err != nil {
+		return false, err
+	}
+	return appUser.IsGlobalAdmin(), nil
 }
 
 func ExtendUserWithRolesAndPermissions(user *User) (err error) {
@@ -1455,6 +1608,9 @@ func DeleteGroupForUser(user string, group string) (bool, error) {
 	userObj, err := GetUser(user)
 	if err != nil {
 		return false, err
+	}
+	if userObj == nil {
+		return false, fmt.Errorf(i18n.Translate("en", "general:The user: %s doesn't exist"), user)
 	}
 
 	userObj.Groups = util.DeleteVal(userObj.Groups, group)
@@ -1482,15 +1638,20 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 	}
 
 	for _, role := range roles {
+		changed := false
 		for j, u := range role.Users {
 			// u = organization/username
 			roleOwner, roleName, err := util.GetOwnerAndNameFromIdWithError(u)
 			if err != nil {
 				return err
 			}
-			if roleName == oldName {
+			if roleOwner == owner && roleName == oldName {
 				role.Users[j] = util.GetId(roleOwner, newName)
+				changed = true
 			}
+		}
+		if !changed {
+			continue
 		}
 		_, err = session.Where("name=?", role.Name).And("owner=?", role.Owner).Update(role)
 		if err != nil {
@@ -1504,6 +1665,7 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 		return err
 	}
 	for _, permission := range permissions {
+		changed := false
 		for j, u := range permission.Users {
 			if u == "*" {
 				continue
@@ -1514,9 +1676,13 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 			if err != nil {
 				return err
 			}
-			if permName == oldName {
+			if permOwner == owner && permName == oldName {
 				permission.Users[j] = util.GetId(permOwner, newName)
+				changed = true
 			}
+		}
+		if !changed {
+			continue
 		}
 		_, err = session.Where("name=?", permission.Name).And("owner=?", permission.Owner).Update(permission)
 		if err != nil {
@@ -1524,12 +1690,22 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 		}
 	}
 
-	_, err = session.Where(fmt.Sprintf("%s = ?", quoteColumn("user")), oldName).Cols("user").Update(&Resource{User: newName})
+	_, err = session.Where(fmt.Sprintf("owner = ? AND %s = ?", quoteColumn("user")), owner, oldName).Cols("user").Update(&Resource{User: newName})
+	if err != nil {
+		return err
+	}
+
+	_, err = session.Where(fmt.Sprintf("organization = ? AND %s = ?", quoteColumn("user")), owner, oldName).Cols("user").Update(&Token{User: newName})
 	if err != nil {
 		return err
 	}
 
 	_, err = session.Where("owner = ? AND user_name = ?", owner, oldName).Cols("user_name").Update(&ThirdPartyLink{UserName: newName})
+	if err != nil {
+		return err
+	}
+
+	_, err = session.Where("owner = ? AND name = ?", owner, oldName).Cols("name").Update(&PasswordHistory{Name: newName})
 	if err != nil {
 		return err
 	}
@@ -1556,14 +1732,6 @@ func (user *User) GetPreferredMfaProps(masked bool) *MfaProps {
 	return user.GetMfaProps(user.PreferredMfaType, masked)
 }
 
-func (user *User) IsApplicationAdmin(application *Application) bool {
-	if user == nil {
-		return false
-	}
-
-	return (user.Owner == application.Organization && user.IsAdmin) || user.IsGlobalAdmin() || (user.IsAdmin && application.IsShared)
-}
-
 func (user *User) IsGlobalAdmin() bool {
 	if user == nil {
 		return false
@@ -1581,17 +1749,45 @@ func (user *User) HasFaceIdImage() bool {
 	return false
 }
 
+const maxFaceIdImageSize = 10 << 20
+
+// getFaceIdImage fetches a face image the user set the URL of, so it must not reach the intranet,
+// except for the files uploaded to the "Local File System" storage, which are read from disk
+func getFaceIdImage(imageUrl string) ([]byte, error) {
+	if data, ok := readLocalUploadedFile(imageUrl); ok {
+		return data, nil
+	}
+
+	resp, err := util.NewInternetOnlyHttpClient(30 * time.Second).Get(imageUrl)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(io.LimitReader(resp.Body, maxFaceIdImageSize))
+}
+
+func readLocalUploadedFile(fileUrl string) ([]byte, bool) {
+	urlObj, err := url.Parse(fileUrl)
+	if err != nil {
+		return nil, false
+	}
+
+	filePath := strings.TrimPrefix(urlObj.Path, "/files/")
+	if filePath == urlObj.Path || !filepath.IsLocal(filePath) {
+		return nil, false
+	}
+
+	data, err := os.ReadFile(filepath.Join("files", filePath))
+	return data, err == nil
+}
+
 func (user *User) CheckUserFace(faceIdImage []string, provider *Provider) (bool, error) {
 	faceIdChecker := faceId.GetFaceIdProvider(provider.Type, provider.ClientId, provider.ClientSecret, provider.Endpoint)
-	httpClient := proxy.DefaultHttpClient
 	errList := []error{}
 	for _, userFaceId := range user.FaceIds {
 		if userFaceId.ImageUrl != "" {
-			imgResp, err := httpClient.Get(userFaceId.ImageUrl)
-			if err != nil {
-				continue
-			}
-			imgByte, err := io.ReadAll(imgResp.Body)
+			imgByte, err := getFaceIdImage(userFaceId.ImageUrl)
 			if err != nil {
 				continue
 			}
@@ -1641,21 +1837,15 @@ func (user *User) GetUserFullGroupPath() ([]string, error) {
 		}
 
 		groupPath := groupName
-
-		curGroup, ok := groupMap[group.ParentId]
-		if !ok {
-			return []string{}, fmt.Errorf(i18n.Translate("en", "auth:The group: %s does not exist"), group.ParentId)
-		}
-		for {
-			groupPath = util.GetId(curGroup.Name, groupPath)
-			if curGroup.IsTopGroup {
-				break
-			}
-
-			curGroup, ok = groupMap[curGroup.ParentId]
+		curGroup := group
+		for !curGroup.IsTopGroup {
+			parentGroup, ok := groupMap[curGroup.ParentId]
 			if !ok {
 				return []string{}, fmt.Errorf(i18n.Translate("en", "auth:The group: %s does not exist"), curGroup.ParentId)
 			}
+
+			groupPath = util.GetId(parentGroup.Name, groupPath)
+			curGroup = parentGroup
 		}
 
 		groupPath = util.GetId(curGroup.Owner, groupPath)
@@ -1663,6 +1853,31 @@ func (user *User) GetUserFullGroupPath() ([]string, error) {
 	}
 
 	return groupFullPath, nil
+}
+
+func (user *User) GetUserGroupNames() []string {
+	groupNames := []string{}
+	for _, groupId := range user.Groups {
+		_, groupName := util.GetOwnerAndNameFromIdNoCheck(groupId)
+		groupNames = append(groupNames, groupName)
+	}
+	return groupNames
+}
+
+func (user *User) GetGroupsForToken(application *Application) ([]string, error) {
+	tokenGroupFormat := ""
+	if application != nil {
+		tokenGroupFormat = application.TokenGroupFormat
+	}
+
+	switch tokenGroupFormat {
+	case "Path":
+		return user.GetUserFullGroupPath()
+	case "Name":
+		return user.GetUserGroupNames(), nil
+	default:
+		return user.Groups, nil
+	}
 }
 
 func GenerateIdForNewUser(application *Application) (string, error) {
@@ -1731,12 +1946,26 @@ func UpdateUserBalance(owner string, name string, balance float64, currency stri
 		}
 	}
 
-	// Validate new balance against credit limit
-	if newBalance < balanceCredit {
+	affected, err := incrBalance(ormer.Engine.ID(core.PK{owner, name}), "balance", convertedBalance, balanceCredit, &User{UpdatedTime: util.GetCurrentTime()})
+	if err != nil {
+		return err
+	}
+	if !affected {
 		return fmt.Errorf(i18n.Translate(lang, "general:Insufficient balance: new balance %v would be below credit limit %v"), newBalance, balanceCredit)
 	}
+	return nil
+}
 
-	user.Balance = newBalance
-	_, err = UpdateUser(user.GetId(), user, []string{"balance"}, true)
-	return err
+// incrBalance adds amount to the column in one statement, a spending is only applied while the
+// column stays at or above the credit, so concurrent payments cannot both spend the same balance
+func incrBalance(session *xorm.Session, column string, amount float64, credit float64, bean interface{}) (bool, error) {
+	if amount == 0 {
+		return true, nil
+	}
+	if amount < 0 {
+		session = session.Where(fmt.Sprintf("%s + ? >= ?", column), amount, credit)
+	}
+
+	affected, err := session.Incr(column, amount).Update(bean)
+	return affected != 0, err
 }

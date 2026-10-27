@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/object"
 	"github.com/casdoor/casdoor/util"
 )
@@ -44,6 +45,32 @@ type SmsForm struct {
 type NotificationForm struct {
 	Content   string `json:"content"`
 	Recipient string `json:"recipient"`
+}
+
+// checkServiceProvider checks that a non-global admin is an org admin sending with a provider of the
+// category that their organization can use: its own one, or a global one unless isOwnOnly. The authz
+// filter authorizes the "owner" of the request, while the provider is picked by its name.
+func (c *ApiController) checkServiceProvider(provider *object.Provider, category string, isOwnOnly bool) bool {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if isGlobalAdmin {
+		return true
+	}
+
+	if user != nil && user.IsAdmin && provider.Category == category && (provider.Owner == user.Owner || (!isOwnOnly && provider.Owner == "admin")) {
+		return true
+	}
+
+	c.ResponseError(c.T("auth:Unauthorized operation"))
+	return false
+}
+
+// pinProviderObjectOwner makes a provider posted by a non-global admin one of their own organization,
+// so that its hosts are checked like the saved providers of that organization
+func (c *ApiController) pinProviderObjectOwner(providerObject *object.Provider) {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if !isGlobalAdmin && user != nil {
+		providerObject.Owner = user.Owner
+	}
 }
 
 // SendEmail
@@ -93,10 +120,30 @@ func (c *ApiController) SendEmail() {
 		}
 	}
 
+	if provider == nil {
+		c.ResponseError(fmt.Sprintf(c.T("util:The provider: %s is not found"), emailForm.Provider))
+		return
+	}
+	if !c.checkServiceProvider(provider, "Email", false) {
+		return
+	}
+
 	if emailForm.ProviderObject.Name != "" {
-		if emailForm.ProviderObject.ClientSecret == "***" {
-			emailForm.ProviderObject.ClientSecret = provider.ClientSecret
+		if emailForm.ProviderObject.ClientSecret == "***" || object.IsHttpHeadersMasked(emailForm.ProviderObject.HttpHeaders) {
+			if conf.IsDemoMode() || conf.IsDemoDatabase() {
+				c.ResponseError(c.T("general:this operation is not allowed in demo mode"))
+				return
+			}
+			// the real secret is sent to the host of providerObject, so only for the provider's own organization
+			if !c.checkServiceProvider(provider, "Email", true) {
+				return
+			}
+			if emailForm.ProviderObject.ClientSecret == "***" {
+				emailForm.ProviderObject.ClientSecret = provider.ClientSecret
+			}
+			emailForm.ProviderObject.HttpHeaders = object.RestoreMaskedHttpHeaders(emailForm.ProviderObject.HttpHeaders, provider.HttpHeaders)
 		}
+		c.pinProviderObjectOwner(&emailForm.ProviderObject)
 		provider = &emailForm.ProviderObject
 	}
 
@@ -179,6 +226,9 @@ func (c *ApiController) SendSms() {
 		c.ResponseError(err.Error())
 		return
 	}
+	if !c.checkServiceProvider(provider, "SMS", false) {
+		return
+	}
 
 	var smsForm SmsForm
 	err = json.Unmarshal(c.Ctx.Input.RequestBody, &smsForm)
@@ -215,6 +265,9 @@ func (c *ApiController) SendNotification() {
 	provider, err := c.GetProviderFromContext("Notification")
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+	if !c.checkServiceProvider(provider, "Notification", false) {
 		return
 	}
 

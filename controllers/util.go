@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -35,6 +36,7 @@ func (c *ApiController) ResponseJsonData(resp *Response, data ...interface{}) {
 		resp.Data = data[0]
 	}
 	c.Data["json"] = resp
+	c.Ctx.Input.SetData("responseStatus", resp.Status)
 	c.ServeJSON()
 }
 
@@ -46,6 +48,11 @@ func (c *ApiController) ResponseOk(data ...interface{}) {
 
 // ResponseError ...
 func (c *ApiController) ResponseError(error string, data ...interface{}) {
+	c.ResponseErrorWithCode("", error, data...)
+}
+
+// ResponseErrorWithCode ...
+func (c *ApiController) ResponseErrorWithCode(code string, error string, data ...interface{}) {
 	enableErrorMask2 := conf.GetConfigBool("enableErrorMask2")
 	if enableErrorMask2 {
 		error = c.T("subscription:Error")
@@ -55,8 +62,48 @@ func (c *ApiController) ResponseError(error string, data ...interface{}) {
 		return
 	}
 
-	resp := &Response{Status: "error", Msg: error}
+	resp := &Response{Status: "error", Code: code, Msg: error}
 	c.ResponseJsonData(resp, data...)
+}
+
+func (c *ApiController) responseSigninError(err error, fallbackReason string) {
+	reason := fallbackReason
+	var signinErr *object.SigninError
+	if errors.As(err, &signinErr) {
+		reason = signinErr.Reason
+	}
+	if reason != "" {
+		c.Ctx.Input.SetParam("recordDetail", reason)
+	}
+	c.ResponseErrorWithCode(reason, err.Error())
+}
+
+// mergeColumns overwrites only the listed fields of obj with the ones in the request body,
+// columns may be written as JSON names (displayName) or column names (display_name)
+func mergeColumns(obj interface{}, body []byte, columnsStr string) error {
+	fields := map[string]json.RawMessage{}
+	err := json.Unmarshal(body, &fields)
+	if err != nil {
+		return err
+	}
+
+	keyMap := map[string]string{}
+	for key := range fields {
+		keyMap[util.CamelToSnakeCase(key)] = key
+	}
+
+	selected := map[string]json.RawMessage{}
+	for _, column := range strings.Split(columnsStr, ",") {
+		if key, ok := keyMap[util.CamelToSnakeCase(strings.TrimSpace(column))]; ok {
+			selected[key] = fields[key]
+		}
+	}
+
+	data, err := json.Marshal(selected)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, obj)
 }
 
 func (c *ApiController) T(error string) string {
@@ -65,11 +112,7 @@ func (c *ApiController) T(error string) string {
 
 // GetAcceptLanguage ...
 func (c *ApiController) GetAcceptLanguage() string {
-	language := c.Ctx.Request.Header.Get("Accept-Language")
-	if len(language) > 2 {
-		language = language[0:2]
-	}
-	return conf.GetLanguage(language)
+	return conf.GetAcceptLanguage(c.Ctx.Request.Header.Get("Accept-Language"))
 }
 
 // SetTokenErrorHttpStatus ...
@@ -109,6 +152,21 @@ func (c *ApiController) RequireSignedInUser() (*object.User, bool) {
 	if object.IsAppUser(userId) {
 		tmpUserId := c.Ctx.Input.Query("userId")
 		if tmpUserId != "" {
+			// an application may only act as a user of its own organization
+			appUser, err := object.GetAppUser(userId)
+			if err != nil {
+				c.ResponseError(err.Error())
+				return nil, false
+			}
+			tmpUserOwner, _, err := util.GetOwnerAndNameFromIdWithError(tmpUserId)
+			if err != nil {
+				c.ResponseError(err.Error())
+				return nil, false
+			}
+			if appUser == nil || (!appUser.IsGlobalAdmin() && tmpUserOwner != appUser.Owner) {
+				c.ResponseError(c.T("auth:Unauthorized operation"))
+				return nil, false
+			}
 			userId = tmpUserId
 		}
 	}
@@ -125,6 +183,34 @@ func (c *ApiController) RequireSignedInUser() (*object.User, bool) {
 	}
 
 	return user, true
+}
+
+// checkCredentialedOrigin refuses a browser request sent from a site CORS does not trust with the
+// session cookie: its CORS response is unreadable, but the request itself would still run as the
+// signed-in user, e.g. a cross-site form posting the attacker's own provider code to be linked.
+func (c *ApiController) checkCredentialedOrigin() bool {
+	origin := c.Ctx.Request.Header.Get("Origin")
+	if origin == "" || util.IsCredentialedOrigin(origin, conf.GetConfigString("origin"), c.Ctx.Request.Host) {
+		return true
+	}
+
+	c.ResponseError(c.T("auth:Unauthorized operation"))
+	return false
+}
+
+// requireSessionUserNameOf returns the name of the signed-in user, who must belong to
+// the organization, for a non-admin listing their own objects of it.
+func (c *ApiController) requireSessionUserNameOf(organization string) (string, bool) {
+	owner, name, err := util.GetOwnerAndNameFromIdWithError(c.GetSessionUsername())
+	if err != nil {
+		c.ResponseError(err.Error())
+		return "", false
+	}
+	if owner != organization {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
+		return "", false
+	}
+	return name, true
 }
 
 // RequireAdmin ...
@@ -146,17 +232,21 @@ func (c *ApiController) RequireAdmin() (string, bool) {
 	return user.Owner, true
 }
 
+func (c *ApiController) RequireGlobalAdmin() bool {
+	if !c.IsGlobalAdmin() {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
+		return false
+	}
+	return true
+}
+
 func (c *ApiController) IsOrgAdmin() (bool, bool) {
 	userId, ok := c.RequireSignedIn()
 	if !ok {
 		return false, true
 	}
 
-	if object.IsAppUser(userId) {
-		return true, true
-	}
-
-	user, err := object.GetUser(userId)
+	user, err := object.GetUserOrAppUser(userId)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return false, false
@@ -177,7 +267,7 @@ func (c *ApiController) IsMaskedEnabled() (bool, bool) {
 	if withSecret == "1" {
 		isMaskEnabled = false
 
-		if conf.IsDemoMode() {
+		if conf.IsDemoMode() || conf.IsDemoDatabase() {
 			c.ResponseError(c.T("general:this operation is not allowed in demo mode"))
 			return false, isMaskEnabled
 		}
@@ -219,6 +309,11 @@ func (c *ApiController) checkKeyPermission(oldKey, key *object.Key) bool {
 
 	// For updates, the key being modified must belong to the caller's org.
 	if oldKey != nil && oldKey.Owner != user.Owner {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
+		return false
+	}
+
+	if !user.IsAdmin && (key.User != user.Name || oldKey != nil && oldKey.User != user.Name) {
 		c.ResponseError(c.T("auth:Unauthorized operation"))
 		return false
 	}

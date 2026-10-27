@@ -197,10 +197,12 @@ func (idp *GiteeIdProvider) GetUserInfo(token *oauth2.Token) (*UserInfo, error) 
 
 	userInfo := UserInfo{
 		Id:          strconv.Itoa(gtUserInfo.Id),
-		Username:    gtUserInfo.Name,
+		Username:    gtUserInfo.Login,
 		DisplayName: gtUserInfo.Name,
 		Email:       gtUserInfo.Email,
-		AvatarUrl:   gtUserInfo.AvatarUrl,
+		// Gitee only exposes the account's confirmed primary email
+		EmailVerified: gtUserInfo.Email != "",
+		AvatarUrl:     gtUserInfo.AvatarUrl,
 	}
 
 	return &userInfo, nil

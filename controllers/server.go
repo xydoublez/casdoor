@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -205,8 +206,11 @@ func (c *ApiController) GetMcpAccessToken() {
 		c.ResponseError(fmt.Sprintf("the application: %s does not belong to the organization: %s", applicationName, organizationName))
 		return
 	}
+	if !c.checkSigninCompleted(user) || !c.checkApplicationSignin(application, user) || !c.checkUserOfApplication(user, application) {
+		return
+	}
 
-	token, err := object.GetTokenByUser(application, user, "read", "", c.Ctx.Request.Host)
+	token, err := object.GetTokenByUser(application, user, "read", "", c.Ctx.Input.CruSession.SessionID(context.Background()), c.Ctx.Request.Host)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return

@@ -44,6 +44,20 @@ func isMcpRequest(urlPath string) bool {
 	return urlPath == "/api/mcp" || strings.HasPrefix(urlPath, "/api/server/")
 }
 
+// responseInvalidToken answers 401 with a challenge on the userinfo endpoint (RFC 6750 section 3.1,
+// RFC 9449 section 7.1), other APIs keep answering 200 with the error in the body
+func responseInvalidToken(ctx *context.Context, token *object.Token, errorCode string, error string) {
+	if ctx.Request.URL.Path == "/api/userinfo" {
+		challenge := fmt.Sprintf("Bearer error=\"%s\", error_description=%q", errorCode, error)
+		if (token != nil && token.TokenType == "DPoP") || strings.HasPrefix(ctx.Request.Header.Get("Authorization"), "DPoP ") {
+			challenge = fmt.Sprintf("DPoP error=\"%s\", error_description=%q, algs=\"%s\"", errorCode, error, strings.Join(object.DPoPSigningAlgs, " "))
+		}
+		ctx.Output.Header("WWW-Authenticate", challenge)
+		ctx.Output.SetStatus(http.StatusUnauthorized)
+	}
+	responseError(ctx, error)
+}
+
 func responseError(ctx *context.Context, error string, data ...interface{}) {
 	// ctx.ResponseWriter.WriteHeader(http.StatusForbidden)
 	urlPath := ctx.Request.URL.Path
@@ -68,8 +82,7 @@ func responseError(ctx *context.Context, error string, data ...interface{}) {
 }
 
 func getAcceptLanguage(ctx *context.Context) string {
-	language := ctx.Request.Header.Get("Accept-Language")
-	return conf.GetLanguage(language)
+	return conf.GetAcceptLanguage(ctx.Request.Header.Get("Accept-Language"))
 }
 
 func T(ctx *context.Context, error string) string {
@@ -90,7 +103,7 @@ func denyMcpRequest(ctx *context.Context, message string) {
 		// localhost:8000 or computer-name:80
 		scheme = "http"
 	}
-	resourceMetadataUrl := fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource", scheme, host)
+	resourceMetadataUrl := fmt.Sprintf("%s://%s%s/.well-known/oauth-protected-resource", scheme, host, basePath)
 	ctx.Output.Header("WWW-Authenticate", fmt.Sprintf("Bearer realm=\"casdoor\", resource_metadata=\"%s\"", resourceMetadataUrl))
 
 	req := mcpself.McpRequest{}
@@ -151,12 +164,7 @@ func getUsernameByClientIdSecret(ctx *context.Context) (string, error) {
 		return "", fmt.Errorf("Incorrect client secret for application: %s", application.Name)
 	}
 
-	for _, tag := range application.Tags {
-		if tag == "dcr" {
-			return fmt.Sprintf("app-dcr/%s", application.Name), nil
-		}
-	}
-	return fmt.Sprintf("app/%s", application.Name), nil
+	return object.GetAppUserId(application), nil
 }
 
 func getUsernameByAccessKey(ctx *context.Context) (string, error) {
@@ -194,6 +202,13 @@ func getUsernameByAccessKey(ctx *context.Context) (string, error) {
 	}
 
 	if key.User != "" {
+		isUserActive, err := key.IsUserActive()
+		if err != nil {
+			return "", err
+		}
+		if !isUserActive {
+			return "", fmt.Errorf("The user of access key: %s is forbidden or deleted", key.Name)
+		}
 		return util.GetId(key.Organization, key.User), nil
 	}
 
@@ -214,6 +229,8 @@ func getSessionUser(ctx *context.Context) string {
 }
 
 func setSessionUser(ctx *context.Context, user string) {
+	ctx.Input.SetData(requestCredentialUserKey, user)
+
 	err := ctx.Input.CruSession.Set(stdcontext.Background(), "username", user)
 	if err != nil {
 		panic(err)
@@ -221,6 +238,50 @@ func setSessionUser(ctx *context.Context, user string) {
 
 	// https://github.com/beego/beego/issues/3445#issuecomment-455411915
 	ctx.Input.CruSession.SessionRelease(stdcontext.Background(), ctx.ResponseWriter)
+}
+
+func setSessionSigninToken(ctx *context.Context, userId string, token *object.Token) {
+	tokenId, _ := ctx.Input.CruSession.Get(stdcontext.Background(), object.SessionSigninTokenId).(string)
+	if tokenId == "" && getSessionUser(ctx) == userId {
+		return
+	}
+
+	err := ctx.Input.CruSession.Set(stdcontext.Background(), object.SessionSigninTokenId, token.GetId())
+	if err != nil {
+		panic(err)
+	}
+}
+
+func clearSessionOfRevokedToken(ctx *context.Context) error {
+	tokenId, _ := ctx.Input.CruSession.Get(stdcontext.Background(), object.SessionSigninTokenId).(string)
+	if tokenId == "" {
+		return nil
+	}
+
+	token, err := object.GetToken(tokenId)
+	if err != nil {
+		return err
+	}
+	if token != nil && token.ExpiresIn > 0 {
+		isExpired, _ := util.IsTokenExpired(token.CreatedTime, token.ExpiresIn)
+		if !isExpired {
+			return nil
+		}
+	}
+
+	return clearSessionOfToken(ctx)
+}
+
+// clearSessionOfToken signs out the session that AutoSigninFilter created from an access token
+func clearSessionOfToken(ctx *context.Context) error {
+	for _, key := range []string{"username", "SessionData", "accessToken", "scope", "aud", object.SessionSigninTokenId} {
+		err := ctx.Input.CruSession.Delete(stdcontext.Background(), key)
+		if err != nil {
+			return err
+		}
+	}
+	ctx.Input.CruSession.SessionRelease(stdcontext.Background(), ctx.ResponseWriter)
+	return nil
 }
 
 func setSessionExpire(ctx *context.Context, ExpireTime int64) {

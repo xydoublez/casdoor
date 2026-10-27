@@ -21,9 +21,9 @@ import (
 	"github.com/beego/beego/v2/core/logs"
 	"github.com/beego/beego/v2/server/web"
 	_ "github.com/beego/beego/v2/server/web/session/redis"
+	_ "github.com/beego/beego/v2/server/web/session/redis_cluster"
 	"github.com/casdoor/casdoor/authz"
 	"github.com/casdoor/casdoor/conf"
-	"github.com/casdoor/casdoor/controllers"
 	"github.com/casdoor/casdoor/ldap"
 	"github.com/casdoor/casdoor/object"
 	"github.com/casdoor/casdoor/proxy"
@@ -34,14 +34,21 @@ import (
 )
 
 func main() {
+	if util.RunAsService(runServer) {
+		return
+	}
+
+	runServer()
+}
+
+func runServer() {
 	web.BConfig.WebConfig.Session.SessionOn = true
 	web.BConfig.WebConfig.Session.SessionName = "casdoor_session_id"
-	if conf.GetConfigString("redisEndpoint") == "" {
-		web.BConfig.WebConfig.Session.SessionProvider = "file"
+	if redisConfig := conf.GetRedisConfig(); redisConfig == nil {
+		web.BConfig.WebConfig.Session.SessionProvider = routers.FileSessionProvider
 		web.BConfig.WebConfig.Session.SessionProviderConfig = "./tmp"
 	} else {
-		web.BConfig.WebConfig.Session.SessionProvider = "redis"
-		web.BConfig.WebConfig.Session.SessionProviderConfig = conf.GetConfigString("redisEndpoint")
+		web.BConfig.WebConfig.Session.SessionProvider, web.BConfig.WebConfig.Session.SessionProviderConfig = redisConfig.GetSessionProvider()
 	}
 	sessionCookieLifeTime := 3600 * 24 * 30
 	if val, err := conf.GetConfigInt64("sessionCookieLifeTime"); err == nil && val > 0 {
@@ -57,6 +64,7 @@ func main() {
 	object.CreateTables()
 
 	object.InitDb()
+	object.InitSetting()
 
 	// Handle export command
 	if object.ShouldExportData() {
@@ -79,7 +87,10 @@ func main() {
 	object.InitCleanupTokens()
 	object.InitCleanupRecords()
 	object.InitCleanupDeviceAuthMap()
+	object.InitCleanupCasTickets()
+	object.InitSamlAssertionStore()
 	object.InitExpirePermissions()
+	object.InitUpdateSubscriptionStates()
 
 	object.InitSiteMap()
 	if len(object.SiteMap) != 0 {
@@ -88,17 +99,17 @@ func main() {
 	}
 
 	util.SafeGoroutine(func() { object.RunSyncUsersJob() })
-	util.SafeGoroutine(func() { controllers.InitCLIDownloader() })
 
 	// web.DelStaticPath("/static")
-	// web.SetStaticPath("/static", "web/build/static")
+	// web.SetStaticPath("/assets", "web/build/assets")
 
 	web.BConfig.WebConfig.DirectoryIndex = true
 	if web.BConfig.RunMode == "dev" {
-		web.SetStaticPath("/swagger", "swagger")
+		web.SetStaticPath("/swagger", routers.GetSwaggerFolder())
 	}
 	web.SetStaticPath("/files", "files")
 	// https://studygolang.com/articles/2303
+	web.InsertFilter("/api/forward-auth", web.BeforeStatic, routers.ForwardAuthFilter)
 	web.InsertFilter("*", web.BeforeStatic, routers.RequestBodyFilter)
 	web.InsertFilter("*", web.BeforeStatic, routers.ContentTypeFilter)
 	web.InsertFilter("*", web.BeforeStatic, routers.UploadedFileFilter)
@@ -152,5 +163,5 @@ func main() {
 		service.Start()
 	}
 
-	web.Run(fmt.Sprintf(":%v", port))
+	web.RunWithMiddleWares(fmt.Sprintf(":%v", port), routers.BasePathMiddleware)
 }

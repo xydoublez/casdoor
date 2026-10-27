@@ -22,6 +22,23 @@ import (
 	"github.com/casdoor/casdoor/util"
 )
 
+// getMaskedCerts hides the private keys of the certs the current user doesn't
+// administer: a global admin sees them all, an org admin only those of their own
+// organization, never the global "admin" certs listed alongside them.
+func (c *ApiController) getMaskedCerts(certs []*object.Cert) []*object.Cert {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if isGlobalAdmin {
+		return certs
+	}
+
+	for _, cert := range certs {
+		if user == nil || !user.IsAdmin || cert.Owner != user.Owner {
+			object.GetMaskedCert(cert)
+		}
+	}
+	return certs
+}
+
 // GetCerts
 // @Title GetCerts
 // @Tag Cert API
@@ -45,15 +62,7 @@ func (c *ApiController) GetCerts() {
 			return
 		}
 
-		if !c.IsAdmin() {
-			certs, err = object.GetMaskedCerts(certs, nil)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
-			}
-		}
-
-		c.ResponseOk(certs)
+		c.ResponseOk(c.getMaskedCerts(certs))
 	} else {
 		limit := util.ParseInt(limit)
 		count, err := object.GetCertCount(owner, field, value)
@@ -69,15 +78,7 @@ func (c *ApiController) GetCerts() {
 			return
 		}
 
-		if !c.IsAdmin() {
-			certs, err = object.GetMaskedCerts(certs, err)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
-			}
-		}
-
-		c.ResponseOk(certs, paginator.Nums())
+		c.ResponseOk(c.getMaskedCerts(certs), paginator.Nums())
 	}
 }
 
@@ -88,6 +89,10 @@ func (c *ApiController) GetCerts() {
 // @Success 200 {array} object.Cert The Response object
 // @router /get-global-certs [get]
 func (c *ApiController) GetGlobalCerts() {
+	if !c.requireGlobalAdmin() {
+		return
+	}
+
 	limit := c.Ctx.Input.Query("pageSize")
 	page := c.Ctx.Input.Query("p")
 	field := c.Ctx.Input.Query("field")
@@ -102,15 +107,7 @@ func (c *ApiController) GetGlobalCerts() {
 			return
 		}
 
-		if !c.IsAdmin() {
-			certs, err = object.GetMaskedCerts(certs, nil)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
-			}
-		}
-
-		c.ResponseOk(certs)
+		c.ResponseOk(c.getMaskedCerts(certs))
 	} else {
 		limit := util.ParseInt(limit)
 		count, err := object.GetGlobalCertsCount(field, value)
@@ -126,15 +123,7 @@ func (c *ApiController) GetGlobalCerts() {
 			return
 		}
 
-		if !c.IsAdmin() {
-			certs, err = object.GetMaskedCerts(certs, nil)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
-			}
-		}
-
-		c.ResponseOk(certs, paginator.Nums())
+		c.ResponseOk(c.getMaskedCerts(certs), paginator.Nums())
 	}
 }
 
@@ -153,8 +142,8 @@ func (c *ApiController) GetCert() {
 		return
 	}
 
-	if !c.IsAdmin() {
-		cert = object.GetMaskedCert(cert)
+	if cert != nil {
+		cert = c.getMaskedCerts([]*object.Cert{cert})[0]
 	}
 
 	c.ResponseOk(cert)
@@ -178,6 +167,11 @@ func (c *ApiController) UpdateCert() {
 		return
 	}
 
+	if err = object.CheckCertName(&cert, id, c.GetAcceptLanguage()); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
 	c.Data["json"] = wrapActionResponse(object.UpdateCert(id, &cert))
 	c.ServeJSON()
 }
@@ -193,6 +187,11 @@ func (c *ApiController) AddCert() {
 	var cert object.Cert
 	err := json.Unmarshal(c.Ctx.Input.RequestBody, &cert)
 	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
+	if err = object.CheckCertName(&cert, "", c.GetAcceptLanguage()); err != nil {
 		c.ResponseError(err.Error())
 		return
 	}
@@ -236,6 +235,10 @@ func (c *ApiController) UpdateCertDomainExpire() {
 	cert, err := object.GetCert(id)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+	if cert == nil {
+		c.ResponseError(c.T("general:The object does not exist"))
 		return
 	}
 

@@ -35,8 +35,8 @@ func StartLdapServer() {
 	serverSsl := ldap.NewServer()
 	routes := ldap.NewRouteMux()
 
-	routes.Bind(handleBind)
-	routes.Search(handleSearch).Label(" SEARCH****")
+	routes.Bind(withRecover(handleBind, func() message.ProtocolOp { return ldap.NewBindResponse(ldap.LDAPResultOperationsError) }))
+	routes.Search(withRecover(handleSearch, func() message.ProtocolOp { return ldap.NewSearchResultDoneResponse(ldap.LDAPResultOperationsError) })).Label(" SEARCH****")
 
 	server.Handle(routes)
 	serverSsl.Handle(routes)
@@ -73,8 +73,20 @@ func StartLdapServer() {
 	}()
 }
 
+func withRecover(handler ldap.HandlerFunc, newErrorResponse func() message.ProtocolOp) ldap.HandlerFunc {
+	return func(w ldap.ResponseWriter, m *ldap.Message) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("LDAP request failed, panic: %v", r)
+				w.Write(newErrorResponse())
+			}
+		}()
+		handler(w, m)
+	}
+}
+
 func getTLSconfig(ldapsCertId string) (*tls.Config, error) {
-	rawCert, err := object.GetCert(ldapsCertId)
+	rawCert, err := object.GetCertEx(ldapsCertId)
 	if err != nil {
 		return nil, err
 	}
@@ -118,9 +130,26 @@ func handleBind(w ldap.ResponseWriter, m *ldap.Message) {
 
 		bindUser, err := object.CheckUserPassword(bindOrg, bindUsername, bindPassword, "en", enableCaptcha, isSigninViaLdap, isPasswordWithLdapEnabled)
 		if err != nil {
-			log.Printf("Bind failed User=%s, Pass=%#v, ErrMsg=%s", string(r.Name()), r.Authentication(), err)
+			log.Printf("Bind failed User=%s, ErrMsg=%s", string(r.Name()), err)
 			res.SetResultCode(ldap.LDAPResultInvalidCredentials)
 			res.SetDiagnosticMessage("invalid credentials ErrMsg: " + err.Error())
+			w.Write(res)
+			return
+		}
+
+		if bindUser.IsMfaEnabled() {
+			log.Printf("Bind failed User=%s, ErrMsg=the user has MFA enabled", string(r.Name()))
+			res.SetResultCode(ldap.LDAPResultInvalidCredentials)
+			res.SetDiagnosticMessage("the user has MFA enabled and cannot bind with a password")
+			w.Write(res)
+			return
+		}
+
+		err = object.CheckPasswordOnlySignin(bindUser, "", "en")
+		if err != nil {
+			log.Printf("Bind failed User=%s, ErrMsg=%s", string(r.Name()), err)
+			res.SetResultCode(ldap.LDAPResultInvalidCredentials)
+			res.SetDiagnosticMessage(err.Error())
 			w.Write(res)
 			return
 		}
@@ -245,57 +274,59 @@ func resolveRequestAttributes(attrs message.AttributeSelection) []string {
 func buildUserSearchEntry(user *object.User, baseDN string, attrs []string, org *object.Organization) message.SearchResultEntry {
 	dn := fmt.Sprintf("uid=%s,cn=%s,%s", user.Id, user.Name, baseDN)
 	e := ldap.NewSearchResultEntry(dn)
-	uidNumberStr := getUidNumber(user)
-	if IsLdapAttrAllowed(org, "uidNumber") {
-		e.AddAttribute("uidNumber", message.AttributeValue(uidNumberStr))
-	}
-	if IsLdapAttrAllowed(org, "gidNumber") {
-		e.AddAttribute("gidNumber", message.AttributeValue(uidNumberStr))
-	}
-	if IsLdapAttrAllowed(org, "homeDirectory") {
-		e.AddAttribute("homeDirectory", message.AttributeValue(getHomeDirectory(user)))
-	}
-	if IsLdapAttrAllowed(org, "cn") {
-		e.AddAttribute("cn", message.AttributeValue(user.Name))
-	}
-	if IsLdapAttrAllowed(org, "uid") {
-		e.AddAttribute("uid", message.AttributeValue(user.Id))
-	}
-	if IsLdapAttrAllowed(org, "mail") {
-		e.AddAttribute("mail", message.AttributeValue(user.Email))
-	}
-	if IsLdapAttrAllowed(org, "mobile") {
-		e.AddAttribute("mobile", message.AttributeValue(user.Phone))
-	}
-	if IsLdapAttrAllowed(org, "sn") {
-		e.AddAttribute("sn", message.AttributeValue(user.LastName))
-	}
-	if IsLdapAttrAllowed(org, "givenName") {
-		e.AddAttribute("givenName", message.AttributeValue(user.FirstName))
-	}
-	// Add POSIX attributes for Linux machine login support
-	if IsLdapAttrAllowed(org, "loginShell") {
-		e.AddAttribute("loginShell", getAttribute("loginShell", user))
-	}
-	if IsLdapAttrAllowed(org, "gecos") {
-		e.AddAttribute("gecos", getAttribute("gecos", user))
-	}
-	// Add SSH public key if available
-	if IsLdapAttrAllowed(org, "sshPublicKey") {
-		sshKey := getAttribute("sshPublicKey", user)
-		if sshKey != "" {
-			e.AddAttribute("sshPublicKey", sshKey)
+
+	added := make(map[string]bool)
+	addAttribute := func(name string, value string) {
+		if !IsLdapAttrAllowed(org, name) {
+			return
 		}
+		added[strings.ToLower(name)] = true
+		e.AddAttribute(message.AttributeDescription(name), message.AttributeValue(value))
 	}
-	// Add objectClass for posixAccount
-	e.AddAttribute("objectClass", "posixAccount")
+
+	uidNumberStr := getUidNumber(user)
+	addAttribute("uidNumber", uidNumberStr)
+	addAttribute("gidNumber", uidNumberStr)
+	addAttribute("homeDirectory", getHomeDirectory(user))
+	addAttribute("cn", user.Name)
+	addAttribute("uid", user.Id)
+	addAttribute("mail", user.Email)
+	addAttribute("mobile", user.Phone)
+	addAttribute("sn", user.LastName)
+	addAttribute("givenName", user.FirstName)
+	// Add POSIX attributes for Linux machine login support
+	addAttribute("loginShell", string(getAttribute("loginShell", user)))
+	addAttribute("gecos", string(getAttribute("gecos", user)))
+	// Add SSH public key if available
+	if sshKey := string(getAttribute("sshPublicKey", user)); sshKey != "" {
+		addAttribute("sshPublicKey", sshKey)
+	}
+	// Add Samba attributes so the entry also works as an SMB account
+	addAttribute("sambaSID", getSambaSid(user))
+	addAttribute("sambaPrimaryGroupSID", getSambaPrimaryGroupSid(user))
+	addAttribute("sambaAcctFlags", getSambaAcctFlags(user))
+	addAttribute("sambaPwdLastSet", getSambaPwdLastSet(user))
+	addAttribute("sambaDomainName", user.Owner)
+	addAttribute("sambaLMPassword", sambaLmPasswordPlaceholder)
+	addAttribute("sambaPasswordHistory", sambaPasswordHistoryPlaceholder)
+	if ntPassword := getSambaNtPassword(user, org); ntPassword != "" {
+		addAttribute("sambaNTPassword", ntPassword)
+	}
+	objectClasses := make([]message.AttributeValue, 0, len(userObjectClasses))
+	for _, objectClass := range userObjectClasses {
+		objectClasses = append(objectClasses, message.AttributeValue(objectClass))
+	}
+	e.AddAttribute("objectClass", objectClasses...)
 	if IsLdapAttrAllowed(org, ldapMemberOfAttr) {
 		for _, group := range user.Groups {
 			e.AddAttribute(ldapMemberOfAttr, message.AttributeValue(groupToDN(group, baseDN)))
 		}
 	}
 	for _, attr := range attrs {
-		if !IsLdapAttrAllowed(org, attr) {
+		if added[strings.ToLower(attr)] || !IsLdapAttrAllowed(org, attr) {
+			continue
+		}
+		if _, ok := getLdapAttributeRelation(attr); !ok {
 			continue
 		}
 		e.AddAttribute(message.AttributeDescription(attr), getAttribute(attr, user))
@@ -371,6 +402,8 @@ func handleRootSearch(w ldap.ResponseWriter, r *message.SearchRequest, res *mess
 		e.AddAttribute("objectClasses", []message.AttributeValue{
 			"( 1.3.6.1.1.1.2.0 NAME 'posixAccount' DESC 'Abstraction of an account with POSIX attributes' SUP top AUXILIARY MUST ( cn $ uid $ uidNumber $ gidNumber $ homeDirectory ) MAY ( userPassword $ loginShell $ gecos $ description ) )",
 			"( 1.3.6.1.1.1.2.2 NAME 'posixGroup' DESC 'Abstraction of a group of accounts' SUP top STRUCTURAL MUST ( cn $ gidNumber ) MAY ( userPassword $ memberUid $ description ) )",
+			"( 1.3.6.1.4.1.7165.2.2.6 NAME 'sambaSamAccount' DESC 'Samba 3.0 Auxiliary SAM Account' SUP top AUXILIARY MUST ( uid $ sambaSID ) MAY ( cn $ sambaLMPassword $ sambaNTPassword $ sambaPwdLastSet $ sambaAcctFlags $ displayName $ sambaPrimaryGroupSID $ sambaDomainName $ sambaPasswordHistory $ description ) )",
+			"( 1.3.6.1.4.1.7165.2.2.8 NAME 'sambaIdmapEntry' DESC 'Mapping from a SID to an ID' SUP top AUXILIARY MUST ( sambaSID ) MAY ( uidNumber $ gidNumber ) )",
 		}...)
 		w.Write(e)
 	}

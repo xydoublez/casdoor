@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"time"
 
@@ -57,9 +58,31 @@ func (c *ApiController) IsAdmin() bool {
 	return isGlobalAdmin || user.IsAdmin
 }
 
+// IsAdminOf checks that the current user administers user2: a global admin does, an
+// org admin only for the users of their own organization.
+func (c *ApiController) IsAdminOf(user2 *object.User) bool {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if isGlobalAdmin {
+		return true
+	}
+
+	return user != nil && user2 != nil && user.IsAdmin && user.Owner == user2.Owner
+}
+
+// IsAdminOfOrganization checks that the current user administers the organization: a
+// global admin does, an org admin only their own organization.
+func (c *ApiController) IsAdminOfOrganization(organization string) bool {
+	isGlobalAdmin, user := c.isGlobalAdmin()
+	if isGlobalAdmin {
+		return true
+	}
+
+	return user != nil && user.IsAdmin && user.Owner == organization
+}
+
 func (c *ApiController) IsAdminOrSelf(user2 *object.User) bool {
 	isGlobalAdmin, user := c.isGlobalAdmin()
-	if isGlobalAdmin || (user != nil && user.IsAdmin) {
+	if isGlobalAdmin {
 		return true
 	}
 
@@ -67,10 +90,7 @@ func (c *ApiController) IsAdminOrSelf(user2 *object.User) bool {
 		return false
 	}
 
-	if user.Owner == user2.Owner && user.Name == user2.Name {
-		return true
-	}
-	return false
+	return user.Owner == user2.Owner && (user.IsAdmin || user.Name == user2.Name)
 }
 
 // requireOrganizationPermission checks that the current user may create an object belonging
@@ -90,11 +110,24 @@ func (c *ApiController) requireOrganizationPermission(organization string) bool 
 	return true
 }
 
+func (c *ApiController) requireGlobalAdmin() bool {
+	if !c.IsGlobalAdmin() {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
+		return false
+	}
+	return true
+}
+
 func (c *ApiController) isGlobalAdmin() (bool, *object.User) {
 	username := c.GetSessionUsername()
 	if object.IsAppUser(username) {
-		// e.g., "app/app-casnode"
-		return true, nil
+		// e.g., "app/app-casnode", an admin of the application's organization
+		appUser, err := object.GetAppUser(username)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return false, nil
+		}
+		return appUser.IsGlobalAdmin(), appUser
 	}
 
 	user := c.getCurrentUser()
@@ -222,9 +255,44 @@ func (c *ApiController) GetSessionOidc() (string, string) {
 	return scope, aud
 }
 
+func (c *ApiController) renewSessionIdForUser(userId string) {
+	if sessionUser, _ := c.GetSession("username").(string); sessionUser == userId {
+		return
+	}
+
+	if c.isSessionCreatedInRequest() {
+		return
+	}
+
+	err := c.SessionRegenerateID()
+	if err != nil {
+		logs.Error("SessionRegenerateID failed, error: %s", err)
+	}
+}
+
+// isSessionCreatedInRequest reports whether the session ID was generated for this request and is already being set in the response
+func (c *ApiController) isSessionCreatedInRequest() bool {
+	sessionId := c.StartSession().SessionID(context.Background())
+	cookies := (&http.Response{Header: c.Ctx.ResponseWriter.Header()}).Cookies()
+	for _, cookie := range cookies {
+		if cookie.Name == web.BConfig.WebConfig.Session.SessionName && cookie.Value == sessionId {
+			return true
+		}
+	}
+	return false
+}
+
 // SetSessionUsername ...
 func (c *ApiController) SetSessionUsername(user string) {
 	c.SetSession("username", user)
+	c.clearSessionOidc()
+}
+
+// clearSessionOidc drops the access token scope and token binding left by AutoSigninFilter, which would otherwise limit an interactive sign-in
+func (c *ApiController) clearSessionOidc() {
+	c.DelSession("scope")
+	c.DelSession("aud")
+	c.DelSession(object.SessionSigninTokenId)
 }
 
 func (c *ApiController) SetSessionToken(accessToken string) {
