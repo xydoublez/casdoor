@@ -2,7 +2,7 @@
 
 ## 项目说明
 
-Casdoor 是一个基于 Go + React 的身份认证与授权平台。后端使用 Beego 框架，前端位于 `web/`（Ant Design）和 `web2/`（shadcn/ui）。
+Casdoor 是一个基于 Go + React 的身份认证与授权平台。后端使用 Beego 框架，前端位于 `web/`（shadcn/ui，主前端）和 `web-old/`（旧版 Ant Design）。
 
 ## 启动方式
 
@@ -22,13 +22,11 @@ rm -f bin/casdoor-server
 CGO_ENABLED=0 go build -o bin/casdoor-server .
 
 # 2. 编译前端（仅在源文件有变更时执行，否则跳过）
+# 后端仅服务 web/build（shadcn/ui 主前端），web-old/ 为旧版前端，一般无需编译。
 # 检查 web/ 是否需要重编：
 #   find web/src -newer web/build/index.html -print -quit
 # 若有输出则执行：
-#   cd web && yarn install && yarn run build && touch build/index.html && cd ..
-# 同理检查 web2/：
-#   find web2/src -newer web2/build/index.html -print -quit
-#   cd web2 && yarn install && yarn run build && touch build/index.html && cd ..
+#   cd web && yarn install && yarn run build && touch web/build/index.html && cd ..
 
 # 3. 启动服务
 mkdir -p logs tmp
@@ -57,8 +55,8 @@ mkdir -p logs tmp
 ### 前端开发
 
 ```bash
-cd web && yarn install && yarn start   # Ant Design 版（端口 3000）
-cd web2 && yarn install && yarn start  # shadcn/ui 版（端口 3001）
+cd web && yarn install && yarn start      # shadcn/ui 主前端（端口 3000）
+cd web-old && yarn install && yarn start  # 旧版 Ant Design 前端
 ```
 
 ## 配置文件
@@ -86,8 +84,8 @@ controllers/   # Beego 控制器（HTTP handlers）
 object/        # 业务逻辑层
 routers/       # 路由注册
 conf/          # 配置文件
-web/           # 前端（React + Ant Design）
-web2/          # 前端（React + shadcn/ui）
+web/           # 主前端（React + shadcn/ui，后端服务此目录的 build）
+web-old/       # 旧版前端（React + Ant Design）
 scripts/       # 启停脚本
 ```
 
