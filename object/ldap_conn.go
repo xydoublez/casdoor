@@ -578,6 +578,14 @@ func SyncLdapUsers(owner string, syncUsers []LdapUser, ldapId string, lang strin
 	}
 
 	ldap, err := GetLdap(ldapId)
+	if err != nil {
+		return nil, nil, err
+	}
+	// GetLdap() returns (nil, nil) for an empty or already deleted id, and ldap is
+	// dereferenced right below for BaseDn/Username.
+	if ldap == nil {
+		return nil, nil, fmt.Errorf("ldap %s doesn't exist", ldapId)
+	}
 
 	var dc []string
 	for _, basedn := range strings.Split(ldap.BaseDn, ",") {
@@ -844,6 +852,11 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 	ldap, err := GetLdap(ldapId)
 	if err != nil {
 		return 0, 0, err
+	}
+	// GetLdap() returns (nil, nil) when the server was deleted meanwhile, e.g. by a
+	// DeleteLdap that ran while this sync cycle was already in flight.
+	if ldap == nil {
+		return 0, 0, fmt.Errorf("ldap %s doesn't exist", ldapId)
 	}
 
 	// Process groups in hierarchical order (parents before children)

@@ -19,12 +19,13 @@ package util
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"regexp"
 	"runtime"
-	"strconv"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -132,12 +133,12 @@ func TestGetVersion(t *testing.T) {
 	assert.Equal(t, "v1.257.0", releaseVersion)
 }
 
-// TestGetVersionInfoReportsNewestReleaseTag guards the upgrade path: a fork that
+// TestGetVersionInfoReportsHighestReleaseTag guards the upgrade path: a fork that
 // merges upstream keeps both lineages reachable, and picking the first tag met by
 // a depth-first walk used to report a stale v3.x tag while the tree actually
-// contained v4.x. GetVersionInfo() must report the newest release tag instead, so
-// cross-check it against an independently computed highest release tag.
-func TestGetVersionInfoReportsNewestReleaseTag(t *testing.T) {
+// contained v4.x. GetVersionInfo() must report the highest reachable release tag,
+// so cross-check it against an independently computed one.
+func TestGetVersionInfoReportsHighestReleaseTag(t *testing.T) {
 	versionInfo, err := GetVersionInfo()
 	if errors.Is(err, git.ErrRepositoryNotExists) {
 		t.Skip("no git repository")
@@ -165,33 +166,20 @@ func TestGetVersionInfoReportsNewestReleaseTag(t *testing.T) {
 	assert.NoError(t, tags.ForEach(func(tag *plumbing.Reference) error {
 		revHash, err := r.ResolveRevision(plumbing.Revision(tag.Name()))
 		if err != nil {
-			return nil
+			// Same tolerance as GetVersionInfo(): a shallow clone can hold a tag
+			// whose target object was never fetched.
+			if errors.Is(err, plumbing.ErrObjectNotFound) {
+				return nil
+			}
+			return err
 		}
 		tagMap[*revHash] = tag.Name().Short()
 		return nil
 	}))
 
-	releaseTag := regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)$`)
-	parse := func(version string) []int {
-		match := releaseTag.FindStringSubmatch(version)
-		if match == nil {
-			return nil
-		}
-		res := make([]int, 0, len(match)-1)
-		for _, part := range match[1:] {
-			num, err := strconv.Atoi(part)
-			if err != nil {
-				return nil
-			}
-			res = append(res, num)
-		}
-		return res
-	}
-
 	// Breadth-first walk collecting every reachable release tag, then pick the
-	// numerically highest one. This is a different selection rule than the one
-	// GetVersionInfo() uses (newest committer date), so a disagreement means a
-	// stale tag has been reported.
+	// numerically highest one. The walk is written out here instead of reusing
+	// GetVersionInfo() so that a regression in its selection rule still fails.
 	visited := make(map[plumbing.Hash]struct{})
 	queue := []*object.Commit{head}
 	visited[head.Hash] = struct{}{}
@@ -205,21 +193,29 @@ func TestGetVersionInfoReportsNewestReleaseTag(t *testing.T) {
 		queue = queue[1:]
 
 		if tag, ok := tagMap[current.Hash]; ok {
-			parts := parse(tag)
+			parts := parseReleaseVersion(tag)
 			if parts != nil && (bestParts == nil || compareVersionParts(parts, bestParts) > 0) {
 				bestParts = parts
 				bestVersion = tag
 			}
 		}
 
-		assert.NoError(t, current.Parents().ForEach(func(parent *object.Commit) error {
+		err := current.Parents().ForEach(func(parent *object.Commit) error {
 			if _, seen := visited[parent.Hash]; seen {
 				return nil
 			}
 			visited[parent.Hash] = struct{}{}
 			queue = append(queue, parent)
 			return nil
-		}))
+		})
+		if err != nil {
+			// Same tolerance as GetVersionInfo(): a shallow clone stops at a
+			// boundary commit whose parents are not in the object database.
+			if !errors.Is(err, io.EOF) && !errors.Is(err, plumbing.ErrObjectNotFound) {
+				assert.NoError(t, err)
+			}
+			break
+		}
 	}
 
 	if bestVersion == "" {
@@ -227,7 +223,7 @@ func TestGetVersionInfoReportsNewestReleaseTag(t *testing.T) {
 	}
 
 	assert.Equal(t, bestVersion, versionInfo.Version,
-		"GetVersionInfo() must report the newest reachable release tag, not a stale one from a merged side branch")
+		"GetVersionInfo() must report the highest reachable release tag, not a stale one from a merged side branch")
 }
 
 func compareVersionParts(a []int, b []int) int {
@@ -243,4 +239,40 @@ func compareVersionParts(a []int, b []int) int {
 		}
 	}
 	return 0
+}
+
+// TestIsBetterVersionTag pins the rule that keeps a merged-in upstream release from
+// being shadowed by a stale tag on the fork side, including the case where the
+// stale tag was committed later.
+func TestIsBetterVersionTag(t *testing.T) {
+	older := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// The v4 release wins over a v3 tag even when the v3 tag is the newer commit,
+	// which is exactly what a fork merging upstream runs into.
+	assert.True(t, isBetterVersionTag("v4.24.0", older, "v3.154.4", newer))
+	assert.False(t, isBetterVersionTag("v3.154.4", newer, "v4.24.0", older))
+
+	// Comparison is numeric, not lexicographic.
+	assert.True(t, isBetterVersionTag("v4.24.0", older, "v4.9.0", newer))
+	assert.True(t, isBetterVersionTag("v4.24.10", older, "v4.24.9", newer))
+
+	// Equal versions fall back to the newer commit date.
+	assert.True(t, isBetterVersionTag("v4.24.0", newer, "v4.24.0", older))
+	assert.False(t, isBetterVersionTag("v4.24.0", older, "v4.24.0", newer))
+
+	// A release tag outranks any non-release tag, and among non-release tags the
+	// newer commit wins.
+	assert.True(t, isBetterVersionTag("v1.2.3", older, "sfx-2026", newer))
+	assert.False(t, isBetterVersionTag("sfx-2026", newer, "v1.2.3", older))
+	assert.True(t, isBetterVersionTag("sfx-2026", newer, "sfx-2025", older))
+}
+
+func TestParseReleaseVersion(t *testing.T) {
+	assert.Equal(t, []int{4, 24, 0}, parseReleaseVersion("v4.24.0"))
+	assert.Equal(t, []int{3, 154, 4}, parseReleaseVersion("v3.154.4"))
+
+	for _, version := range []string{"", "dev", "v4.24", "4.24.0", "v4.24.0-dirty", "v4.24.0-1-gabc", "sfx_release+v4.24.0"} {
+		assert.Nil(t, parseReleaseVersion(version), "parseReleaseVersion(%q) must be nil", version)
+	}
 }
