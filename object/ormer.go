@@ -77,7 +77,14 @@ func GetExportFilePath() string {
 }
 
 func InitConfig() {
-	err := web.LoadAppConfig("ini", "../conf/app.conf")
+	// Allow tests to run against a non-default database (e.g. the local
+	// PostgreSQL config) without touching conf/app.conf.
+	loadConfigPath := "../conf/app.conf"
+	if p := os.Getenv("CASDOOR_TEST_CONFIG"); p != "" {
+		loadConfigPath = p
+	}
+
+	err := web.LoadAppConfig("ini", loadConfigPath)
 	if err != nil {
 		panic(err)
 	}

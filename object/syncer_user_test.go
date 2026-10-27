@@ -23,6 +23,9 @@ import (
 func TestGetUsers(t *testing.T) {
 	InitConfig()
 	syncers, _ := GetSyncers("admin")
+	if len(syncers) == 0 {
+		t.Skip("no syncer owned by \"admin\" is configured, skipping")
+	}
 	syncer := syncers[0]
 	syncer.initAdapter()
 	users, _ := syncer.getOriginalUsers()
@@ -32,6 +35,11 @@ func TestGetUsers(t *testing.T) {
 }
 
 func TestSyncUsers(t *testing.T) {
+	// RunSyncUsersJob() ends with an infinite sleep by design (it is a
+	// blocking job entrypoint), so it can never complete inside `go test`.
+	// Run it manually against a database that has syncers instead.
+	t.Skip("RunSyncUsersJob() blocks forever by design, run it manually instead")
+
 	InitConfig()
 
 	RunSyncUsersJob()

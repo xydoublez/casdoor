@@ -25,11 +25,17 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/shirou/gopsutil/v4/process"
 )
+
+// versionSearchCutoff bounds the history walk done by GetVersionInfo(), the same
+// way git describe caps its own search, so a large repository cannot turn a
+// version lookup into a full history scan.
+const versionSearchCutoff = 2000
 
 type SystemInfo struct {
 	CpuUsage     []float64 `json:"cpuUsage"`
@@ -162,6 +168,13 @@ func GetSystemInfo() (*SystemInfo, error) {
 }
 
 // GetVersionInfo get git current commit and repo release version
+//
+// It follows the same semantics as `git describe --tags`: walk the history
+// breadth-first from HEAD and report the reachable tag whose commit is the
+// newest one, together with how many commits away it is. A plain depth-first
+// walk is not enough here, because a fork that merges upstream keeps two lineages
+// alive and DFS would happily return an old v3.x tag from the fork side while the
+// merged-in upstream history is already at v4.x.
 func GetVersionInfo() (*VersionInfo, error) {
 	res := &VersionInfo{
 		Version:      "",
@@ -202,43 +215,70 @@ func GetVersionInfo() (*VersionInfo, error) {
 		return res, err
 	}
 
-	cIter, err := r.Log(&git.LogOptions{From: ref.Hash()})
+	head, err := r.CommitObject(ref.Hash())
 	if err != nil {
 		return res, err
 	}
 
-	defer cIter.Close()
+	// Breadth-first walk, bounded like git describe's own cutoff so that a huge
+	// history cannot make this call expensive.
+	type entry struct {
+		commit *object.Commit
+		depth  int
+	}
 
-	commitOffset := 0
-	version := ""
-	// iterates over the commits
-	for {
-		c, err := cIter.Next()
+	visited := make(map[plumbing.Hash]struct{}, versionSearchCutoff)
+	queue := []entry{{commit: head, depth: 0}}
+	visited[head.Hash] = struct{}{}
+
+	var (
+		bestTag  string
+		bestWhen time.Time
+		bestAt   int
+		found    bool
+	)
+
+	for len(queue) > 0 && len(visited) < versionSearchCutoff {
+		cur := queue[0]
+		queue = queue[1:]
+
+		if tag, ok := tagMap[cur.commit.Hash]; ok {
+			// The newest tagged commit wins, so a stale tag on a side branch
+			// never shadows the release the code actually contains.
+			if !found || cur.commit.Committer.When.After(bestWhen) {
+				found = true
+				bestTag = tag
+				bestWhen = cur.commit.Committer.When
+				bestAt = cur.depth
+			}
+		}
+
+		err = cur.commit.Parents().ForEach(func(parent *object.Commit) error {
+			if _, seen := visited[parent.Hash]; seen {
+				return nil
+			}
+			visited[parent.Hash] = struct{}{}
+			queue = append(queue, entry{commit: parent, depth: cur.depth + 1})
+			return nil
+		})
 		if err != nil {
-			// The parents of a shallow clone's boundary commit are not in the
-			// object database, so walk as far as the history actually goes
-			// instead of reporting the truncation as a failure.
+			// A shallow clone stops at a boundary commit whose parents are not in
+			// the object database, walk as far as the history actually goes.
 			if errors.Is(err, io.EOF) || errors.Is(err, plumbing.ErrObjectNotFound) {
 				break
 			}
 			return res, err
 		}
+	}
 
-		tag, ok := tagMap[c.Hash]
-		if ok {
-			if version == "" {
-				version = tag
-			}
-		}
-		if version == "" {
-			commitOffset++
-		}
+	if !found {
+		return res, nil
 	}
 
 	res = &VersionInfo{
-		Version:      version,
+		Version:      bestTag,
 		CommitId:     ref.Hash().String(),
-		CommitOffset: commitOffset,
+		CommitOffset: bestAt,
 	}
 	return res, nil
 }

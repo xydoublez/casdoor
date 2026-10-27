@@ -43,11 +43,18 @@ casdoor
 web/cypress/videos/
 web/cypress/screenshots/
 casdoor.tar.gz
+# sfx 定制发布包（build.sh 产物，文件名形如 sfx_release+v4.24.0-35-gxxxx-linux-amd64.tar.gz）
+sfx_release+*.tar.gz
+# 双架构静态编译产物
+server_linux_amd64
+server_linux_arm64
+# go test 生成的初始数据导出文件
+object/init_data_dump.json
 /__pycache__
 /out
 app-pg.conf
-web2/build.log
 web/build.log
+web-old/build.log
 __pycache__/
 .qoder/
 web-old/cypress/videos/

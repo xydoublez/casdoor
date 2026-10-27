@@ -23,6 +23,7 @@ import (
 	"path"
 	"regexp"
 	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/go-git/go-git/v5"
@@ -129,4 +130,117 @@ func TestGetVersion(t *testing.T) {
 
 	assert.Equal(t, 3, aheadCnt)
 	assert.Equal(t, "v1.257.0", releaseVersion)
+}
+
+// TestGetVersionInfoReportsNewestReleaseTag guards the upgrade path: a fork that
+// merges upstream keeps both lineages reachable, and picking the first tag met by
+// a depth-first walk used to report a stale v3.x tag while the tree actually
+// contained v4.x. GetVersionInfo() must report the newest release tag instead, so
+// cross-check it against an independently computed highest release tag.
+func TestGetVersionInfoReportsNewestReleaseTag(t *testing.T) {
+	versionInfo, err := GetVersionInfo()
+	if errors.Is(err, git.ErrRepositoryNotExists) {
+		t.Skip("no git repository")
+	}
+	assert.NoError(t, err)
+	if versionInfo.Version == "" {
+		t.Skip("no tag is reachable from HEAD")
+	}
+
+	assert.Regexp(t, regexp.MustCompile(`^v\d+\.\d+\.\d+$`), versionInfo.Version)
+	assert.GreaterOrEqual(t, versionInfo.CommitOffset, 0)
+
+	_, filename, _, _ := runtime.Caller(0)
+	r, err := git.PlainOpen(path.Dir(path.Dir(filename)))
+	assert.NoError(t, err)
+
+	ref, err := r.Head()
+	assert.NoError(t, err)
+	head, err := r.CommitObject(ref.Hash())
+	assert.NoError(t, err)
+
+	tags, err := r.Tags()
+	assert.NoError(t, err)
+	tagMap := make(map[plumbing.Hash]string)
+	assert.NoError(t, tags.ForEach(func(tag *plumbing.Reference) error {
+		revHash, err := r.ResolveRevision(plumbing.Revision(tag.Name()))
+		if err != nil {
+			return nil
+		}
+		tagMap[*revHash] = tag.Name().Short()
+		return nil
+	}))
+
+	releaseTag := regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)$`)
+	parse := func(version string) []int {
+		match := releaseTag.FindStringSubmatch(version)
+		if match == nil {
+			return nil
+		}
+		res := make([]int, 0, len(match)-1)
+		for _, part := range match[1:] {
+			num, err := strconv.Atoi(part)
+			if err != nil {
+				return nil
+			}
+			res = append(res, num)
+		}
+		return res
+	}
+
+	// Breadth-first walk collecting every reachable release tag, then pick the
+	// numerically highest one. This is a different selection rule than the one
+	// GetVersionInfo() uses (newest committer date), so a disagreement means a
+	// stale tag has been reported.
+	visited := make(map[plumbing.Hash]struct{})
+	queue := []*object.Commit{head}
+	visited[head.Hash] = struct{}{}
+
+	var (
+		bestVersion string
+		bestParts   []int
+	)
+	for len(queue) > 0 && len(visited) < versionSearchCutoff {
+		current := queue[0]
+		queue = queue[1:]
+
+		if tag, ok := tagMap[current.Hash]; ok {
+			parts := parse(tag)
+			if parts != nil && (bestParts == nil || compareVersionParts(parts, bestParts) > 0) {
+				bestParts = parts
+				bestVersion = tag
+			}
+		}
+
+		assert.NoError(t, current.Parents().ForEach(func(parent *object.Commit) error {
+			if _, seen := visited[parent.Hash]; seen {
+				return nil
+			}
+			visited[parent.Hash] = struct{}{}
+			queue = append(queue, parent)
+			return nil
+		}))
+	}
+
+	if bestVersion == "" {
+		t.Skip("no release tag is reachable from HEAD")
+	}
+
+	assert.Equal(t, bestVersion, versionInfo.Version,
+		"GetVersionInfo() must report the newest reachable release tag, not a stale one from a merged side branch")
+}
+
+func compareVersionParts(a []int, b []int) int {
+	for i := range a {
+		if i >= len(b) {
+			return 1
+		}
+		if a[i] != b[i] {
+			if a[i] > b[i] {
+				return 1
+			}
+			return -1
+		}
+	}
+	return 0
 }
