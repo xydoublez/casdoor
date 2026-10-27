@@ -175,7 +175,8 @@ if [ "${SKIP_FRONTEND}" = "0" ]; then
         export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}"
 
         echo ">> 前端编译: web"
-        (cd web && yarn install && yarn run build && touch build/index.html) || { echo "!! web/ 编译失败，详见 web/build.log"; exit 1; }
+        # 输出直接留在终端，不落 build.log：失败时报错就在上方，避免指向过期日志
+        (cd web && yarn install && yarn run build && touch build/index.html) || { echo "!! web/ 编译失败，详见上方 yarn 输出"; exit 1; }
         echo ">> 前端编译完成"
     else
         echo ">> 前端 build 已是最新，跳过编译（FORCE_FRONTEND=1 可强制重编）"

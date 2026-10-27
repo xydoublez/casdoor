@@ -17,6 +17,7 @@ package object
 
 import (
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -35,10 +36,13 @@ func TestGetUsers(t *testing.T) {
 }
 
 func TestSyncUsers(t *testing.T) {
-	// RunSyncUsersJob() ends with an infinite sleep by design (it is a
-	// blocking job entrypoint), so it can never complete inside `go test`.
-	// Run it manually against a database that has syncers instead.
-	t.Skip("RunSyncUsersJob() blocks forever by design, run it manually instead")
+	// RunSyncUsersJob() ends with an infinite sleep by design (it is a blocking
+	// job entrypoint), so it can never finish under `go test`. Opt in explicitly
+	// to exercise it against a database that actually has syncers:
+	//   CASDOOR_TEST_SYNC_USERS=1 go test ./object/ -run TestSyncUsers -timeout 0
+	if os.Getenv("CASDOOR_TEST_SYNC_USERS") == "" {
+		t.Skip("RunSyncUsersJob() blocks forever by design, set CASDOOR_TEST_SYNC_USERS=1 to run it manually")
+	}
 
 	InitConfig()
 

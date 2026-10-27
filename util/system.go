@@ -20,7 +20,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -169,12 +171,12 @@ func GetSystemInfo() (*SystemInfo, error) {
 
 // GetVersionInfo get git current commit and repo release version
 //
-// It follows the same semantics as `git describe --tags`: walk the history
-// breadth-first from HEAD and report the reachable tag whose commit is the
-// newest one, together with how many commits away it is. A plain depth-first
-// walk is not enough here, because a fork that merges upstream keeps two lineages
-// alive and DFS would happily return an old v3.x tag from the fork side while the
-// merged-in upstream history is already at v4.x.
+// It walks the history breadth-first from HEAD, bounded like git describe's own
+// cutoff, and reports the highest reachable release tag (vX.Y.Z) together with how
+// many commits away it is. Walking depth-first and taking the first tag met is not
+// enough here: a fork that merges upstream keeps two lineages alive, and DFS would
+// happily return an old v3.x tag from the fork side while the merged-in upstream
+// history is already at v4.x.
 func GetVersionInfo() (*VersionInfo, error) {
 	res := &VersionInfo{
 		Version:      "",
@@ -243,9 +245,7 @@ func GetVersionInfo() (*VersionInfo, error) {
 		queue = queue[1:]
 
 		if tag, ok := tagMap[cur.commit.Hash]; ok {
-			// The newest tagged commit wins, so a stale tag on a side branch
-			// never shadows the release the code actually contains.
-			if !found || cur.commit.Committer.When.After(bestWhen) {
+			if !found || isBetterVersionTag(tag, cur.commit.Committer.When, bestTag, bestWhen) {
 				found = true
 				bestTag = tag
 				bestWhen = cur.commit.Committer.When
@@ -281,6 +281,54 @@ func GetVersionInfo() (*VersionInfo, error) {
 		CommitOffset: bestAt,
 	}
 	return res, nil
+}
+
+// releaseVersionRegex matches the vX.Y.Z tags Casdoor publishes.
+var releaseVersionRegex = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)$`)
+
+func parseReleaseVersion(version string) []int {
+	match := releaseVersionRegex.FindStringSubmatch(version)
+	if match == nil {
+		return nil
+	}
+
+	res := make([]int, 0, len(match)-1)
+	for _, part := range match[1:] {
+		num, err := strconv.Atoi(part)
+		if err != nil {
+			return nil
+		}
+		res = append(res, num)
+	}
+	return res
+}
+
+// isBetterVersionTag decides which of two reachable tags GetVersionInfo() reports.
+// A release tag (vX.Y.Z) outranks any other tag, and the highest release version
+// wins, so a stale v3.x tag that stays reachable after merging upstream cannot
+// shadow the v4.x release the tree actually contains. Comparing by commit date
+// alone is not enough here: a maintenance tag cut later on an older branch would
+// otherwise be reported as the current version. Equal versions fall back to the
+// newer commit date, the same tie-break git describe uses.
+func isBetterVersionTag(candidate string, candidateWhen time.Time, current string, currentWhen time.Time) bool {
+	candidateParts := parseReleaseVersion(candidate)
+	currentParts := parseReleaseVersion(current)
+
+	switch {
+	case candidateParts == nil && currentParts == nil:
+		return candidateWhen.After(currentWhen)
+	case candidateParts == nil:
+		return false
+	case currentParts == nil:
+		return true
+	}
+
+	for i := range candidateParts {
+		if candidateParts[i] != currentParts[i] {
+			return candidateParts[i] > currentParts[i]
+		}
+	}
+	return candidateWhen.After(currentWhen)
 }
 
 func GetBuiltInVersionInfo() *VersionInfo {

@@ -207,6 +207,9 @@ install_files() {
     echo "originFrontend ="
     echo "staticBaseUrl = \"https://cdn.casbin.org\""
     echo "isDemoMode = false"
+    # 定制版禁止应用内自升级到官方 release：官方二进制会覆盖掉本地定制内容，
+    # 升级统一走本脚本的 --upgrade（版本号门控之外的第二道保险）
+    echo "disableUpgrade = true"
     echo "batchSize = 100"
     echo "showGithubCorner = false"
     echo "forceLanguage = \"\""
