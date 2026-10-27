@@ -303,13 +303,70 @@ func (r *permissionGroupResolver) getUsersInGroup(permissionOwner string, groupI
 		return []string{}, nil
 	}
 
-	users, err := userEnforcer.GetAllUsersByGroup(groupId)
+	// The group hierarchy (ParentId) is never written into Casbin grouping rows,
+	// so resolving a parent group must aggregate the members of its sub-groups.
+	// Load the policy once for the whole loop, GetAllUsersByGroup() would
+	// otherwise read the entire policy table again for every sub-group.
+	groupIds, err := r.getGroupIdsWithDescendants(groupOwner, groupName)
 	if err != nil {
 		return nil, err
 	}
 
+	err = userEnforcer.LoadPolicy()
+	if err != nil {
+		return nil, err
+	}
+
+	usersByID := map[string]struct{}{}
+	for _, currentGroupId := range groupIds {
+		users, err := userEnforcer.getAllUsersByGroup(currentGroupId)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, user := range users {
+			usersByID[user] = struct{}{}
+		}
+	}
+
+	users := make([]string, 0, len(usersByID))
+	for user := range usersByID {
+		users = append(users, user)
+	}
+
 	r.usersByGroup[groupId] = users
 	return users, nil
+}
+
+// getGroupIdsWithDescendants returns the id of the given group together with the
+// ids of all of its descendant groups.
+func (r *permissionGroupResolver) getGroupIdsWithDescendants(owner string, groupName string) ([]string, error) {
+	groups, err := r.getGroups(owner)
+	if err != nil {
+		return nil, err
+	}
+
+	groupIds := []string{util.GetId(owner, groupName)}
+	visited := map[string]struct{}{groupName: {}}
+
+	// breadth-first walk over the group table, visited guards against cycles.
+	for i := 0; i < len(groupIds); i++ {
+		_, currentName := util.GetOwnerAndNameFromIdNoCheck(groupIds[i])
+
+		for _, group := range groups {
+			if group.Owner != owner || group.IsTopGroup || group.ParentId != currentName {
+				continue
+			}
+			if _, ok := visited[group.Name]; ok {
+				continue
+			}
+
+			visited[group.Name] = struct{}{}
+			groupIds = append(groupIds, group.GetId())
+		}
+	}
+
+	return groupIds, nil
 }
 
 func getPermissionEnforcerTargets(permission *Permission, permissionIDs ...string) ([]*Permission, error) {

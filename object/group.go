@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/i18n"
@@ -177,6 +179,8 @@ func UpdateGroup(id string, group *Group, isGlobalAdmin bool, lang string) (bool
 		return false, err
 	}
 
+	invalidateGroupCache(oldGroup.Owner, group.Owner)
+
 	return affected != 0, nil
 }
 
@@ -191,6 +195,8 @@ func AddGroup(group *Group) (bool, error) {
 		return false, err
 	}
 
+	invalidateGroupCache(group.Owner)
+
 	return affected != 0, nil
 }
 
@@ -201,6 +207,10 @@ func AddGroups(groups []*Group) (bool, error) {
 	affected, err := ormer.Engine.Insert(groups)
 	if err != nil {
 		return false, err
+	}
+
+	for _, group := range groups {
+		invalidateGroupCache(group.Owner)
 	}
 	return affected != 0, nil
 }
@@ -237,6 +247,12 @@ func AddGroupsInBatch(groups []*Group) (bool, error) {
 		return false, err
 	}
 
+	owners := make([]string, 0, len(groups))
+	for _, group := range groups {
+		owners = append(owners, group.Owner)
+	}
+	invalidateGroupCache(owners...)
+
 	return true, nil
 }
 
@@ -245,6 +261,8 @@ func deleteGroup(group *Group) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+
+	invalidateGroupCache(group.Owner)
 
 	return affected != 0, nil
 }
@@ -316,6 +334,107 @@ func ConvertToTreeData(groups []*Group, parentId string) []*Group {
 		}
 	}
 	return treeData
+}
+
+// groupCache caches the group table per owner for hierarchy resolution.
+// isGroupHit / getRolesByUser resolve ancestors per permission per application,
+// which would otherwise re-read the whole group table each time. The cache is
+// invalidated by every in-process group write; the short TTL is only a safety
+// net for writes coming from other instances or direct DB edits.
+var groupCache sync.Map // owner -> *cachedGroupTree
+
+const groupCacheTTL = 10 * time.Second
+
+type cachedGroupTree struct {
+	groups   []*Group
+	groupMap map[string]*Group
+	expires  time.Time
+}
+
+func getCachedGroupTree(owner string) ([]*Group, map[string]*Group, error) {
+	if v, ok := groupCache.Load(owner); ok {
+		cached := v.(*cachedGroupTree)
+		if time.Now().Before(cached.expires) {
+			return cached.groups, cached.groupMap, nil
+		}
+	}
+
+	groups, err := GetGroups(owner)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	groupMap := make(map[string]*Group, len(groups))
+	for _, group := range groups {
+		groupMap[group.Name] = group
+	}
+
+	groupCache.Store(owner, &cachedGroupTree{groups: groups, groupMap: groupMap, expires: time.Now().Add(groupCacheTTL)})
+	return groups, groupMap, nil
+}
+
+func invalidateGroupCache(owners ...string) {
+	for _, owner := range owners {
+		groupCache.Delete(owner)
+	}
+}
+
+// GetGroupIdsWithAncestors expands the given group ids to themselves plus all of
+// their ancestor groups. The group hierarchy (ParentId) is never materialized into
+// user.Groups nor into Casbin grouping rows, so membership checks that bind a
+// parent group must resolve the hierarchy explicitly.
+func GetGroupIdsWithAncestors(owner string, groupIds []string) ([]string, error) {
+	if len(groupIds) == 0 {
+		return groupIds, nil
+	}
+
+	groups, groupMap, err := getCachedGroupTree(owner)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]string, 0, len(groupIds))
+	seen := make(map[string]struct{})
+	collect := func(groupId string) {
+		if _, ok := seen[groupId]; ok {
+			return
+		}
+		seen[groupId] = struct{}{}
+		res = append(res, groupId)
+	}
+
+	for _, groupId := range groupIds {
+		collect(groupId)
+
+		// Legacy data may store bare group names without the "owner/" prefix,
+		// skip those instead of panicking on the id split.
+		_, groupName, err := util.GetOwnerAndNameFromIdWithError(groupId)
+		if err != nil {
+			continue
+		}
+		curGroup, ok := groupMap[groupName]
+		if !ok {
+			continue
+		}
+
+		// depth bounds the walk so a cyclic ParentId cannot loop forever.
+		for depth := 0; !curGroup.IsTopGroup && depth < len(groups); depth++ {
+			parentName := curGroup.ParentId
+			if parentName == "" || parentName == curGroup.Name {
+				break
+			}
+
+			parentGroup, ok := groupMap[parentName]
+			if !ok {
+				break
+			}
+
+			collect(parentGroup.GetId())
+			curGroup = parentGroup
+		}
+	}
+
+	return res, nil
 }
 
 func GetGroupUserCount(groupId string, field, value string) (int64, error) {
@@ -477,17 +596,21 @@ func GroupChangeTrigger(oldName, newName string) error {
 	if err != nil {
 		return err
 	}
+	renamedGroupOwners := []string{}
 	for _, group := range groups {
 		group.ParentId = newName
 		_, err := session.ID(core.PK{group.Owner, group.Name}).Cols("parent_id").Update(group)
 		if err != nil {
 			return err
 		}
+		renamedGroupOwners = append(renamedGroupOwners, group.Owner)
 	}
 
 	err = session.Commit()
 	if err != nil {
 		return err
 	}
+
+	invalidateGroupCache(renamedGroupOwners...)
 	return nil
 }

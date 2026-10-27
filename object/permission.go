@@ -603,12 +603,20 @@ func (p *Permission) isGroupHit(userId string) bool {
 		return false
 	}
 
+	// user.Groups only contains the groups the user directly belongs to and the
+	// group hierarchy is never materialized there, so a permission bound to a
+	// parent group would never match. Expand with the ancestor groups first.
+	userGroupIds, err := GetGroupIdsWithAncestors(user.Owner, user.Groups)
+	if err != nil {
+		return false
+	}
+
 	for _, group := range p.Groups {
 		if group == "*" || group == util.GetId(p.Owner, "*") {
 			return len(user.Groups) > 0
 		}
 
-		if util.InSlice(user.Groups, group) {
+		if util.InSlice(userGroupIds, group) {
 			return true
 		}
 	}

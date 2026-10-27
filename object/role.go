@@ -235,8 +235,17 @@ func getRolesByUserInternal(userId string) ([]*Role, error) {
 		return nil, fmt.Errorf("The user: %s doesn't exist", userId)
 	}
 
+	// The group hierarchy (ParentId) is never materialized into user.Groups, so a
+	// role bound to a parent group would not be resolved for users that only
+	// belong to its sub-groups. Expand before both the SQL pre-filter and the
+	// exact membership check below.
+	userGroupIds, err := GetGroupIdsWithAncestors(user.Owner, user.Groups)
+	if err != nil {
+		return nil, err
+	}
+
 	query := ormer.Engine.Alias("r").Where("r.users like ?", fmt.Sprintf("%%%s%%", userId))
-	for _, group := range user.Groups {
+	for _, group := range userGroupIds {
 		query = query.Or("r.groups like ?", fmt.Sprintf("%%%s%%", group))
 	}
 
@@ -248,7 +257,7 @@ func getRolesByUserInternal(userId string) ([]*Role, error) {
 
 	res := []*Role{}
 	for _, role := range roles {
-		if util.InSlice(role.Users, userId) || util.HaveIntersection(role.Groups, user.Groups) {
+		if util.InSlice(role.Users, userId) || util.HaveIntersection(role.Groups, userGroupIds) {
 			res = append(res, role)
 		}
 	}
