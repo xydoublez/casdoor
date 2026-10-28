@@ -16,8 +16,8 @@ package util
 
 var (
 	Version      = "v4.24.0"
-	CommitId     = "e7da36ff5fd72c8b185dbacd64912bc69b88ea1f"
-	CommitOffset = 30
+	CommitId     = "cfdc4810fa9b377916b05ee803527912c4bf6c38"
+	CommitOffset = 32
 	// BuildType is set to "release" by .goreleaser.yaml, only such binaries can upgrade themselves
 	BuildType = ""
 )
