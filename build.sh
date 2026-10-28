@@ -38,7 +38,11 @@ fi
 #     HasNewVersion 恒为 false，应用内“自升级到官方 release”不会触发，
 #     定制内容不会被官方包覆盖；升级一律走 deploy-systemd.sh --upgrade
 #   - 可用环境变量 SFX_VERSION 覆盖
-BASE_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+# 只匹配 vX.Y.Z 形态的发布标签：git describe --tags 默认会接受任意标签，一旦仓库里
+# 出现杂散标签（例如误把发布包文件名打成标签），版本号就会被污染并逐次自我放大。
+# 该规则与 util.GetVersionInfo() 的 releaseVersionRegex 保持一致；无匹配标签时
+# --always 回落为短提交号。
+BASE_VERSION="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --always --dirty 2>/dev/null || echo unknown)"
 COMMIT_ID="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 # 日期戳取构建机本地日期（“当天日期”），BUILD_TIME 保留 UTC 精确时刻
 BUILD_DATE="${BUILD_DATE:-$(date '+%Y%m%d')}"
