@@ -22,10 +22,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// The version string build.sh injects into a customized build. It must never be
-// mistaken for an official release tag, otherwise the in-app self-upgrade would
-// replace the customized binary with the official one and drop every local patch.
-const customVersion = "sfx_release+v4.24.0-35-gc4591a5f"
+// The version string build.sh injects into a customized build:
+// sfx_release+<git describe>+<build date>. It must never be mistaken for an
+// official release tag, otherwise the in-app self-upgrade would replace the
+// customized binary with the official one and drop every local patch.
+const customVersion = "sfx_release+v4.24.0-37-gcb05f10b+20261028"
 
 func TestParseVersion(t *testing.T) {
 	assert.Equal(t, []int{4, 24, 0}, parseVersion("v4.24.0"))
@@ -34,7 +35,11 @@ func TestParseVersion(t *testing.T) {
 
 	// Anything that is not a plain release tag must be rejected, so that a
 	// customized or development build is never treated as an official release.
-	for _, version := range []string{customVersion, "dev", "", "v4.24", "v4.24.0-1-gc4591a5f", "4.24.0", "v4.24.0-dirty", "sfx_release+v4.24.0"} {
+	// The date suffix a customized build carries must not change that either.
+	for _, version := range []string{
+		customVersion, "sfx_release+v4.24.0+20261028", "sfx_release+v4.24.0", "sfx_release+20261028",
+		"dev", "", "v4.24", "v4.24.0-1-gc4591a5f", "4.24.0", "v4.24.0-dirty", "v4.24.0+20261028",
+	} {
 		assert.Nil(t, parseVersion(version), "parseVersion(%q) must be nil", version)
 	}
 }
@@ -76,7 +81,9 @@ func TestIsSelfUpgradeableReleaseGate(t *testing.T) {
 	// with BuildType=release, otherwise the official asset would overwrite every
 	// local patch. Its version is not a plain release tag, so the gate stays shut.
 	assert.False(t, isSelfUpgradeableRelease(customVersion, "release"))
+	assert.False(t, isSelfUpgradeableRelease("sfx_release+v4.24.0+20261028", "release"))
 	assert.False(t, isSelfUpgradeableRelease("sfx_release+v4.24.0", "release"))
+	assert.False(t, isSelfUpgradeableRelease("v4.24.0+20261028", "release"))
 	assert.False(t, isSelfUpgradeableRelease("v4.24.0-1-gc4591a5f", "release"))
 	assert.False(t, isSelfUpgradeableRelease("v4.24.0-dirty", "release"))
 

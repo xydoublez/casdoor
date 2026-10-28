@@ -7,10 +7,11 @@
 #   ./build.sh                    # 编译双架构二进制并打包（默认打包本机架构）
 #   PKG_ARCH=arm64 ./build.sh     # 打包 arm64 版本的发布包
 #   SFX_VERSION=xxx ./build.sh    # 覆盖自动生成的定制版本号
+#   BUILD_DATE=20261028 ./build.sh # 覆盖版本尾部的日期戳（默认取当天）
 #
 # 产物:
-#   sfx_release+<git describe>-linux-<arch>.tar.gz   定制发布包（主产物）
-#   casdoor.tar.gz                                   同内容副本，供 deploy-systemd.sh --upgrade 自动发现
+#   sfx_release+<git describe>+<YYYYMMDD>-linux-<arch>.tar.gz   定制发布包（主产物）
+#   casdoor.tar.gz                                             同内容副本，供 deploy-systemd.sh --upgrade 自动发现
 #
 # 说明:
 #   - server_linux_amd64 / server_linux_arm64 两个文件名被 Dockerfile 引用，勿改名
@@ -29,15 +30,19 @@ fi
 # ---------- 版本信息（ldflags 注入，见 /api/get-version-info） ----------
 # 注意: -X 仅支持 string 变量，util.CommitOffset 为 int 无法注入（保持默认 0）
 #
-# 定制版本号规则: sfx_release+<git describe>
+# 定制版本号规则: sfx_release+<git describe>+<当天日期 YYYYMMDD>
+#   例: sfx_release+v4.24.0-37-gcb05f10b+20261028
 #   - 前缀 sfx_release+ 用于和官方 casdoor 发行版区分（生产环境为 v3，本仓库已合并到 v4）
+#   - 尾部日期戳使同一天内多次构建、以及不同日期的同代码构建都能一眼区分
 #   - 该字符串带非 vX.Y.Z 形态，因此 upgrade.parseVersion() 无法解析，
 #     HasNewVersion 恒为 false，应用内“自升级到官方 release”不会触发，
 #     定制内容不会被官方包覆盖；升级一律走 deploy-systemd.sh --upgrade
 #   - 可用环境变量 SFX_VERSION 覆盖
 BASE_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
 COMMIT_ID="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-SFX_VERSION="${SFX_VERSION:-sfx_release+${BASE_VERSION}}"
+# 日期戳取构建机本地日期（“当天日期”），BUILD_TIME 保留 UTC 精确时刻
+BUILD_DATE="${BUILD_DATE:-$(date '+%Y%m%d')}"
+SFX_VERSION="${SFX_VERSION:-sfx_release+${BASE_VERSION}+${BUILD_DATE}}"
 BUILD_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 case "${BASE_VERSION}" in
@@ -126,6 +131,7 @@ fi
 cat > "${PKG}/VERSION.txt" <<EOF
 version     = ${SFX_VERSION}
 baseVersion = ${BASE_VERSION}
+buildDate   = ${BUILD_DATE}
 commitId    = ${COMMIT_ID}
 buildTime   = ${BUILD_TIME}
 arch        = linux/${PKG_ARCH}

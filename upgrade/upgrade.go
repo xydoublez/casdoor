@@ -132,10 +132,10 @@ func GetDeploymentType() string {
 
 // isSelfUpgradeableRelease reports whether a binary carrying this version and build
 // type is an official release allowed to replace itself with a newer official
-// asset. A customized build stamps a version like "sfx_release+v4.24.0-35-gc4591a5f"
-// which is not a release tag, so the gate stays closed and a customized deployment
-// can never be overwritten by an official binary; its upgrades go through
-// deploy-systemd.sh --upgrade instead.
+// asset. A customized build stamps a version like
+// "sfx_release+v4.24.0-37-gcb05f10b+20261028" which is not a release tag, so the
+// gate stays closed and a customized deployment can never be overwritten by an
+// official binary; its upgrades go through deploy-systemd.sh --upgrade instead.
 func isSelfUpgradeableRelease(version string, buildType string) bool {
 	return buildType == "release" && releaseTagRegex.MatchString(version)
 }
