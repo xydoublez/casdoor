@@ -481,7 +481,15 @@ func getPermissionsAndRolesByUser(userId string) ([]*Permission, []*Role, error)
 		return nil, nil, err
 	}
 	if user != nil {
-		groupIds := append([]string{}, user.Groups...)
+		// user.Groups only holds the groups the user directly belongs to, so a
+		// permission bound to a parent group would never be found for a user
+		// inside a sub-group. Expand with the ancestor groups first.
+		userGroupIds, err := GetGroupIdsWithAncestors(user.Owner, user.Groups)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		groupIds := append([]string{}, userGroupIds...)
 		if len(user.Groups) > 0 {
 			groupIds = append(groupIds, "*", util.GetId(user.Owner, "*"))
 		}
