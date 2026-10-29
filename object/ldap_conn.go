@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -979,6 +980,83 @@ func SyncLdapGroups(owner string, ldapGroups []LdapGroup, ldapId string) (newGro
 		if err != nil {
 			// Log error but continue processing other groups
 			continue
+		}
+	}
+
+	// ----- Nesting pass: fold AD-style "group contains group" into ExtraParentIds -----
+	// The OU hierarchy lives in ParentId; a group's member list may also contain
+	// other groups (DN) that are not its OU children. Treat those as an additional
+	// parent link so that a permission on the outer group covers the nested one.
+	//
+	// Only ExtraParentIds is touched here — ParentId / IsTopGroup remain the OU
+	// container relationship, so the tree view and rename-trigger still work.
+	//
+	// Runs after every group has been processed so existingGroupMap is complete.
+	// ExtraParentIds is REBUILT from the current member lists on every sync: a
+	// nesting removed upstream must disappear here too, otherwise permissions
+	// granted through the outer group would keep applying forever.
+	newParents := map[string][]string{} // nested member group name -> outer group names
+	outerNames := map[string]struct{}{} // every group name managed by this sync
+	for i := range ldapGroups {
+		outerName := dnToGroupName(owner, ldapGroups[i].Dn)
+		if outerName == "" {
+			continue
+		}
+		outerNames[outerName] = struct{}{}
+
+		for _, memberDn := range ldapGroups[i].Member {
+			// A member DN counts as a nested group only when it is itself one
+			// of the synced group/OU entries (dnToGroup only holds entries the
+			// objectClass filters accepted). Matching by RDN value alone would
+			// let a user whose CN collides with a group name inherit that
+			// group's permissions.
+			if _, ok := dnToGroup[memberDn]; !ok {
+				continue
+			}
+
+			memberName := dnToGroupName(owner, memberDn)
+			if memberName == "" || memberName == outerName || memberName == owner {
+				continue
+			}
+			if _, ok := existingGroupMap[memberName]; !ok {
+				continue
+			}
+			if !slices.Contains(newParents[memberName], outerName) {
+				newParents[memberName] = append(newParents[memberName], outerName)
+			}
+		}
+	}
+
+	// Rewrite every group whose nesting this sync owns: the newly computed
+	// memberships, plus groups whose stored ExtraParentIds point at one of this
+	// sync's outer groups (covers removals, including outer groups deleted
+	// upstream). Groups nested by other sources stay untouched.
+	for memberName, target := range existingGroupMap {
+		if target == nil {
+			continue
+		}
+
+		inScope := false
+		if _, ok := newParents[memberName]; ok {
+			inScope = true
+		} else {
+			for _, parent := range target.ExtraParentIds {
+				if _, ok := outerNames[parent]; ok {
+					inScope = true
+					break
+				}
+			}
+		}
+		if !inScope {
+			continue
+		}
+
+		if parents := newParents[memberName]; !slices.Equal(target.ExtraParentIds, parents) {
+			target.ExtraParentIds = parents
+			_, err := UpdateGroup(target.GetId(), target, true, "")
+			if err != nil {
+				continue
+			}
 		}
 	}
 
