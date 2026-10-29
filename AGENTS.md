@@ -115,7 +115,15 @@ scripts/       # 启停脚本
 
 - **演变链**：`13cd8e59`（组层级初版）→ `d89cd51f`（完整修复）→ 合并 `0d1df1f8`（语义被上游重写覆盖）→ 本次回退修复。
 
-### 2. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
+### 2. 面包屑显示 URL 编码组名（BreadcrumbBar 解码）— 2026-10-29 回退修复
+
+- **症状**：群组页面包屑最后一级显示百分号编码原文（如 `%E4%BC%97%E9%98%B3%E5%81%A5%E5%BA%B7%E9%9B%86%E5%9B%A2`），而非解码后的中文组名（众阳健康集团）。
+- **根因**：`f13a408d`（2026-08-31）的 `safeDecodeURIComponent` 修复加在旧 antd 前端 `web/src/common/BreadcrumbBar.js`；上游合并 `0d1df1f8` 将 web2→web 重命名后，主前端变为 shadcn 版，其 `web/src/components/layout/BreadcrumbBar.tsx` 虽注明 "ported from web/src/common/BreadcrumbBar.js" 但未移植解码逻辑；旧文件随 antd 前端移入 `web-old/`，修复只留在不再被服务的旧前端里。
+- **修复**：`web/src/components/layout/BreadcrumbBar.tsx` 增加 `safeDecodeURIComponent`；`RESOURCE_LABELS` 查找键用原始段、显示标签用解码段；改完必须重编前端（`cd web && yarn run build && touch web/build/index.html`），否则后端仍服务旧 bundle。
+- **验证**：`npx tsc --noEmit` 通过；浏览器实测 `/groups/test/%E4%BC%97...` 面包屑显示「众阳健康集团」。
+- **演变链**：`f13a408d`（旧前端修复）→ 合并 `0d1df1f8`（前端换壳，修复未移植）→ 本次回退修复（新前端）。
+
+### 3. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
 |---|---|---|---|
@@ -127,5 +135,6 @@ scripts/       # 启停脚本
 | Syncer AffiliationTable 的 Ormer 空指针守卫 | `13cd8e59` | `object/syncer_sync.go` | 在位 |
 | 前端构建目录解析：`frontendBaseDir` 失效/未设时回退 `web/build` | `95f7bed2` | `routers/static_filter.go` `getWebBuildFolder` | 在位 |
 | TagsInput 接受 string/null/undefined 并归一化为 string[] | `95f7bed2` | `web/src/components/common/TagsInput.tsx`（原 web2，上游重命名 web2→web） | 在位 |
+| 面包屑 safeDecodeURIComponent 解码（CJK 组名不显示百分号编码） | `f13a408d`（2026-10-29 重新应用到新前端，见上文 §2） | `web/src/components/layout/BreadcrumbBar.tsx` + `web-old/src/common/BreadcrumbBar.js` | 在位 |
 | goroutine panic 打印调用堆栈 | `13cd8e59` | `util/routine.go` `SafeGoroutine` | 在位 |
 | 上游 web/web2 目录重命名适配（后端仅服务 `web/build`） | `c4591a5f` | `scripts/start_pg.sh` 等 | 在位 |
