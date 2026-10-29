@@ -63,6 +63,17 @@ interface Crumb {
   to?: string;
 }
 
+// Path segments carrying CJK names (e.g. a group) arrive percent-encoded, so the
+// raw segment must be decoded before it is shown as a breadcrumb label. A malformed
+// sequence is shown as-is instead of throwing.
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export function buildBreadcrumbItems(pathname: string): Crumb[] | null {
   const pathSegments = (pathname || "").split("/").filter(Boolean);
   if (pathSegments.length === 0) {
@@ -80,8 +91,9 @@ export function buildBreadcrumbItems(pathname: string): Crumb[] | null {
     return [home, {label: i18next.t(listLabelKey)}];
   }
 
-  const lastSegment = pathSegments[pathSegments.length - 1];
-  const lastLabelKey = RESOURCE_LABELS[lastSegment];
+  const rawLastSegment = pathSegments[pathSegments.length - 1];
+  const lastSegment = safeDecodeURIComponent(rawLastSegment);
+  const lastLabelKey = RESOURCE_LABELS[rawLastSegment];
   return [
     home,
     {label: i18next.t(listLabelKey), to: `/${rootSegment}`},
