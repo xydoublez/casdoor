@@ -17,6 +17,7 @@ package object
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,14 +35,15 @@ type Group struct {
 	CreatedTime string `xorm:"varchar(100)" json:"createdTime"`
 	UpdatedTime string `xorm:"varchar(100)" json:"updatedTime"`
 
-	DisplayName  string   `xorm:"varchar(100)" json:"displayName"`
-	Manager      string   `xorm:"varchar(100)" json:"manager"`
-	ContactEmail string   `xorm:"varchar(100)" json:"contactEmail"`
-	Type         string   `xorm:"varchar(100)" json:"type"`
-	ParentId     string   `xorm:"varchar(100)" json:"parentId"`
-	ParentName   string   `xorm:"-" json:"parentName"`
-	IsTopGroup   bool     `xorm:"bool" json:"isTopGroup"`
-	Users        []string `xorm:"-" json:"users"`
+	DisplayName    string   `xorm:"varchar(100)" json:"displayName"`
+	Manager        string   `xorm:"varchar(100)" json:"manager"`
+	ContactEmail   string   `xorm:"varchar(100)" json:"contactEmail"`
+	Type           string   `xorm:"varchar(100)" json:"type"`
+	ParentId       string   `xorm:"varchar(100)" json:"parentId"`
+	ParentName     string   `xorm:"-" json:"parentName"`
+	IsTopGroup     bool     `xorm:"bool" json:"isTopGroup"`
+	ExtraParentIds []string `xorm:"mediumtext" json:"extraParentIds,omitempty"`
+	Users          []string `xorm:"-" json:"users"`
 
 	Title        string   `json:"title,omitempty"`
 	Key          string   `json:"key,omitempty"`
@@ -425,6 +427,10 @@ func invalidateGroupCache(owners ...string) {
 // their ancestor groups. The group hierarchy (ParentId) is never materialized into
 // user.Groups nor into Casbin grouping rows, so membership checks that bind a
 // parent group must resolve the hierarchy explicitly.
+//
+// A group's "ancestors" are both its OU-container parent (ParentId / IsTopGroup) and
+// every group that contains it as an LDAP member (ExtraParentIds — populated by
+// AD-style group member nesting).
 func GetGroupIdsWithAncestors(owner string, groupIds []string) ([]string, error) {
 	if len(groupIds) == 0 {
 		return groupIds, nil
@@ -446,33 +452,50 @@ func GetGroupIdsWithAncestors(owner string, groupIds []string) ([]string, error)
 	}
 
 	for _, groupId := range groupIds {
-		collect(groupId)
-
 		// Legacy data may store bare group names without the "owner/" prefix,
 		// skip those instead of panicking on the id split.
 		_, groupName, err := util.GetOwnerAndNameFromIdWithError(groupId)
 		if err != nil {
+			collect(groupId)
 			continue
 		}
-		curGroup, ok := groupMap[groupName]
+
+		startGroup, ok := groupMap[groupName]
 		if !ok {
+			collect(groupId)
 			continue
 		}
 
-		// depth bounds the walk so a cyclic ParentId cannot loop forever.
-		for depth := 0; !curGroup.IsTopGroup && depth < len(groups); depth++ {
-			parentName := curGroup.ParentId
-			if parentName == "" || parentName == curGroup.Name {
-				break
-			}
+		// Walk upward from startGroup, treating both ParentId (OU container) and
+		// ExtraParentIds (group member nesting) as parents.  visited guards
+		// against cycles that either source may introduce.
+		visited := map[string]struct{}{startGroup.Name: {}}
+		stack := []*Group{startGroup}
+		for len(stack) > 0 && len(visited) <= len(groups) {
+			curGroup := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			collect(curGroup.GetId())
 
-			parentGroup, ok := groupMap[parentName]
-			if !ok {
-				break
+			candidates := make([]string, 0, 1+len(curGroup.ExtraParentIds))
+			if !curGroup.IsTopGroup && curGroup.ParentId != "" && curGroup.ParentId != curGroup.Name {
+				candidates = append(candidates, curGroup.ParentId)
 			}
+			candidates = append(candidates, curGroup.ExtraParentIds...)
 
-			collect(parentGroup.GetId())
-			curGroup = parentGroup
+			for _, parentName := range candidates {
+				if parentName == curGroup.Name {
+					continue
+				}
+				if _, ok := visited[parentName]; ok {
+					continue
+				}
+				parentGroup, ok := groupMap[parentName]
+				if !ok {
+					continue
+				}
+				visited[parentName] = struct{}{}
+				stack = append(stack, parentGroup)
+			}
 		}
 	}
 
@@ -645,6 +668,31 @@ func GroupChangeTrigger(owner string, oldName string, newName string) error {
 	for _, group := range groups {
 		group.ParentId = newName
 		_, err := session.ID(core.PK{group.Owner, group.Name}).Cols("parent_id").Update(group)
+		if err != nil {
+			return err
+		}
+		renamedGroupOwners = append(renamedGroupOwners, group.Owner)
+	}
+
+	// Update ExtraParentIds that reference the renamed group — the nesting parent
+	// stored as a bare name must follow the rename. The column holds a JSON
+	// array, so match precisely in memory instead of a substring LIKE that also
+	// drags in groups whose other parents merely contain oldName as a substring.
+	ownerGroups := []*Group{}
+	err = session.Where("owner = ?", owner).Find(&ownerGroups)
+	if err != nil {
+		return err
+	}
+	for _, group := range ownerGroups {
+		if !slices.Contains(group.ExtraParentIds, oldName) {
+			continue
+		}
+		for i, name := range group.ExtraParentIds {
+			if name == oldName {
+				group.ExtraParentIds[i] = newName
+			}
+		}
+		_, err := session.ID(core.PK{group.Owner, group.Name}).Cols("extra_parent_ids").Update(group)
 		if err != nil {
 			return err
 		}

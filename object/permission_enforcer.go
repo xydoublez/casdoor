@@ -346,7 +346,8 @@ func (r *permissionGroupResolver) getUsersInGroup(permissionOwner string, groupI
 }
 
 // getGroupIdsWithDescendants returns the id of the given group together with the
-// ids of all of its descendant groups.
+// ids of all of its descendant groups (children through both ParentId OU hierarchy
+// and ExtraParentIds LDAP group member nesting).
 func (r *permissionGroupResolver) getGroupIdsWithDescendants(owner string, groupName string) ([]string, error) {
 	groups, err := r.getGroups(owner)
 	if err != nil {
@@ -361,9 +362,23 @@ func (r *permissionGroupResolver) getGroupIdsWithDescendants(owner string, group
 		_, currentName := util.GetOwnerAndNameFromIdNoCheck(groupIds[i])
 
 		for _, group := range groups {
-			if group.Owner != owner || group.IsTopGroup || group.ParentId != currentName {
+			if group.Owner != owner {
 				continue
 			}
+
+			isChild := (!group.IsTopGroup && group.ParentId == currentName)
+			if !isChild {
+				for _, extraParent := range group.ExtraParentIds {
+					if extraParent == currentName {
+						isChild = true
+						break
+					}
+				}
+			}
+			if !isChild {
+				continue
+			}
+
 			if _, ok := visited[group.Name]; ok {
 				continue
 			}
