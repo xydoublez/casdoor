@@ -17,7 +17,7 @@ export interface GridCardItem {
  * An application opened from this grid signs the visitor in without asking again,
  * which is what `wrappedAsSilentSigninLink()` does in web/src/basic/SingleCard.js.
  */
-function silentSigninLink(link: string) {
+export function silentSigninLink(link: string) {
   if (!link.startsWith("http")) {
     return link;
   }
