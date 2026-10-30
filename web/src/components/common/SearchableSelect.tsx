@@ -32,6 +32,14 @@ interface SearchableSelectProps {
   contentClassName?: string;
   /** keep a value that is not part of options (e.g. loaded from the backend) */
   allowUnknownValue?: boolean;
+  /**
+   * Server-side search: the parent replaces `options` with the backend matches,
+   * so the client-side filter is skipped and every keystroke is reported here.
+   */
+  onSearch?: (search: string) => void;
+  /** scrolling the list to its bottom loads the next page of a remote source */
+  onLoadMore?: () => void;
+  hasMore?: boolean;
 }
 
 /**
@@ -47,12 +55,33 @@ export function SearchableSelect({
   className,
   contentClassName,
   allowUnknownValue = true,
+  onSearch,
+  onLoadMore,
+  hasMore = false,
 }: SearchableSelectProps) {
   const [open, setOpen] = React.useState(false);
+  const [search, setSearch] = React.useState("");
+
+  const handleListScroll = (event: React.SyntheticEvent<HTMLDivElement>) => {
+    if (!onLoadMore || !hasMore) {
+      return;
+    }
+    const list = event.currentTarget;
+    if (list.scrollHeight - list.scrollTop - list.clientHeight < 48) {
+      onLoadMore();
+    }
+  };
+
+  // `options` may be swapped for a page of search results, but the trigger still
+  // has to show the label of the picked value, so remember every label seen
+  const labelCache = React.useRef(new Map<string, React.ReactNode>());
+  React.useEffect(() => {
+    options.forEach((o) => labelCache.current.set(o.value, o.label));
+  }, [options]);
 
   const items = React.useMemo(() => {
     if (allowUnknownValue && value && !options.some((o) => o.value === value)) {
-      return [{value, label: value}, ...options];
+      return [{value, label: labelCache.current.get(value) ?? value}, ...options];
     }
     return options;
   }, [options, value, allowUnknownValue]);
@@ -60,7 +89,17 @@ export function SearchableSelect({
   const selected = items.find((o) => o.value === value);
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) {
+          // a closed dropdown starts fresh: the base page, not stale matches
+          setSearch("");
+          onSearch?.("");
+        }
+      }}
+    >
       <PopoverTrigger asChild>
         <Button
           type="button"
@@ -77,16 +116,27 @@ export function SearchableSelect({
       </PopoverTrigger>
       <PopoverContent className={cn("w-[--radix-popover-trigger-width] p-0", contentClassName)} align="start">
         <Command
-          filter={(itemValue, search) => {
-            const option = items.find((o) => o.value === itemValue);
-            const haystack = `${itemValue} ${option?.keywords ?? ""} ${
-              typeof option?.label === "string" ? option.label : ""
-            }`.toLowerCase();
-            return haystack.includes(search.toLowerCase()) ? 1 : 0;
-          }}
+          filter={
+            onSearch
+              ? () => 1
+              : (itemValue, searchValue) => {
+                const option = items.find((o) => o.value === itemValue);
+                const haystack = `${itemValue} ${option?.keywords ?? ""} ${
+                  typeof option?.label === "string" ? option.label : ""
+                }`.toLowerCase();
+                return haystack.includes(searchValue.toLowerCase()) ? 1 : 0;
+              }
+          }
         >
-          <CommandInput placeholder={i18next.t("general:Search")} />
-          <CommandList>
+          <CommandInput
+            placeholder={i18next.t("general:Search")}
+            value={search}
+            onValueChange={(v) => {
+              setSearch(v);
+              onSearch?.(v);
+            }}
+          />
+          <CommandList onScroll={handleListScroll}>
             <CommandEmpty>{i18next.t("general:No data")}</CommandEmpty>
             <CommandGroup>
               {items.map((option) => (

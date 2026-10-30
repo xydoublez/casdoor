@@ -24,7 +24,7 @@ export default function RoleEditPage() {
     {type: "text", name: "name", labelKey: "general:Name", required: true},
     {type: "text", name: "displayName", labelKey: "general:Display name"},
     {type: "text", name: "description", labelKey: "general:Description"},
-    {type: "multiselect", name: "users", labelKey: "role:Sub users", options: () => users},
+    {type: "multiselect", name: "users", labelKey: "role:Sub users", options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "multiselect", name: "groups", labelKey: "role:Sub groups", options: () => groups},
     {type: "multiselect", name: "roles", labelKey: "role:Sub roles", options: () => roles},
     {type: "tags", name: "domains", labelKey: "role:Sub domains"},

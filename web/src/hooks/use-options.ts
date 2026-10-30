@@ -72,14 +72,190 @@ export function useOrganizationOptions(): SearchableOption[] {
   return React.useMemo(() => toNameOptions(items), [items]);
 }
 
-export function useUserOptions(organizationName: string): SearchableOption[] {
-  const items = useList(() => (organizationName ? UserBackend.getUsers(organizationName, 1, PAGE_SIZE) : null), [organizationName]);
-  return React.useMemo(() => toIdOptions(items), [items]);
+/** how many backend matches a combobox search pulls per page */
+const SEARCH_SIZE = 100;
+
+export interface RemoteOptions {
+  options: SearchableOption[];
+  /** feed the combobox input here; "" restores the base pages */
+  onSearch: (search: string) => void;
+  /** scroll the combobox list to its bottom to reach everyone beyond the loaded pages */
+  onLoadMore: () => void;
+  hasMore: boolean;
 }
 
-export function useUserNameOptions(organizationName: string): SearchableOption[] {
-  const items = useList(() => (organizationName ? UserBackend.getUsers(organizationName, 1, PAGE_SIZE) : null), [organizationName]);
-  return React.useMemo(() => toNameOptions(items), [items]);
+function mergeUnseen(prev: any[], rows: any[]): any[] {
+  const seen = new Set(prev.map((user: any) => `${user.owner}/${user.name}`));
+  const merged = [...prev];
+  rows.forEach((user: any) => {
+    const id = `${user.owner}/${user.name}`;
+    if (!seen.has(id)) {
+      seen.add(id);
+      merged.push(user);
+    }
+  });
+  return merged;
+}
+
+/**
+ * The users of one organization for comboboxes. A base page alone would hide
+ * everyone beyond it from the search (a user like `lizhiqiang` was unfindable in
+ * an organization of thousands), so the input goes to the backend name and
+ * displayName filters instead — what the antd PaginateSelect used to do — and
+ * scrolling the list keeps appending pages, base and search alike, so nothing
+ * stays out of reach behind the first page.
+ */
+function useUserOptionSource(organizationName: string, map: (items: any[]) => SearchableOption[]): RemoteOptions {
+  const [base, setBase] = React.useState<any[]>([]);
+  const basePage = React.useRef(0);
+  const [baseHasMore, setBaseHasMore] = React.useState(false);
+  const baseInFlight = React.useRef(false);
+  const baseTicket = React.useRef(0);
+
+  const [matches, setMatches] = React.useState<any[] | null>(null);
+  const matchPage = React.useRef(0);
+  const [matchHasMore, setMatchHasMore] = React.useState(false);
+  const matchInFlight = React.useRef(false);
+  const seq = React.useRef(0);
+  const query = React.useRef("");
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const orgRef = React.useRef(organizationName);
+  orgRef.current = organizationName;
+
+  const loadBasePage = (page: number) => {
+    const org = orgRef.current;
+    if (!org || baseInFlight.current) {
+      return;
+    }
+    const ticket = baseTicket.current;
+    baseInFlight.current = true;
+    UserBackend.getUsers(org, page, PAGE_SIZE)
+      .then((res: any) => {
+        if (ticket !== baseTicket.current) {
+          return;
+        }
+        const rows = res?.status === "ok" ? res.data ?? [] : [];
+        basePage.current = page;
+        setBase((prev) => (page === 1 ? rows : mergeUnseen(prev, rows)));
+        setBaseHasMore(rows.length === PAGE_SIZE);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        baseInFlight.current = false;
+        if (ticket !== baseTicket.current) {
+          loadBasePage(1);
+        }
+      });
+  };
+
+  const pendingFetch = React.useRef<{search: string; page: number; append: boolean} | null>(null);
+
+  const runFetchMatches = (search: string, page: number, append: boolean) => {
+    const org = orgRef.current;
+    if (!org) {
+      return;
+    }
+    const ticket = ++seq.current;
+    matchInFlight.current = true;
+    Promise.all([
+      UserBackend.getUsers(org, page, SEARCH_SIZE, "name", search),
+      UserBackend.getUsers(org, page, SEARCH_SIZE, "displayName", search),
+    ])
+      .then(([byName, byDisplayName]) => {
+        if (ticket !== seq.current) {
+          return;
+        }
+        const rows: any[] = [];
+        [byName, byDisplayName].forEach((res: any) => {
+          if (res?.status === "ok") {
+            rows.push(...(res.data ?? []));
+          }
+        });
+        matchPage.current = page;
+        setMatches((prev) => mergeUnseen(append && prev ? prev : [], rows));
+        setMatchHasMore(
+          (byName?.data?.length ?? 0) === SEARCH_SIZE || (byDisplayName?.data?.length ?? 0) === SEARCH_SIZE,
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        matchInFlight.current = false;
+        const pending = pendingFetch.current;
+        pendingFetch.current = null;
+        if (pending) {
+          runFetchMatches(pending.search, pending.page, pending.append);
+        }
+      });
+  };
+
+  const fetchMatches = (search: string, page: number, append: boolean) => {
+    if (matchInFlight.current) {
+      // a slow request in flight must not swallow the newest query or page:
+      // run it as soon as the connection frees up (latest request wins)
+      pendingFetch.current = {search, page, append};
+      return;
+    }
+    runFetchMatches(search, page, append);
+  };
+
+  React.useEffect(() => {
+    baseTicket.current += 1;
+    seq.current += 1;
+    pendingFetch.current = null;
+    setBase([]);
+    setMatches(null);
+    setMatchHasMore(false);
+    query.current = "";
+    loadBasePage(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [organizationName]);
+
+  React.useEffect(() => () => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+    }
+  }, []);
+
+  const onSearch = (search: string) => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+    const trimmed = search.trim();
+    query.current = trimmed;
+    if (!trimmed) {
+      seq.current += 1;
+      pendingFetch.current = null;
+      setMatches(null);
+      setMatchHasMore(false);
+      return;
+    }
+    timer.current = setTimeout(() => fetchMatches(trimmed, 1, false), 300);
+  };
+
+  const onLoadMore = () => {
+    if (matches !== null) {
+      if (matchHasMore && query.current) {
+        fetchMatches(query.current, matchPage.current + 1, true);
+      }
+      return;
+    }
+    if (baseHasMore) {
+      loadBasePage(basePage.current + 1);
+    }
+  };
+
+  const options = React.useMemo(() => map(matches ?? base), [matches, base, map]);
+  return {options, onSearch, onLoadMore, hasMore: matches !== null ? matchHasMore : baseHasMore};
+}
+
+export function useUserOptions(organizationName: string): RemoteOptions {
+  return useUserOptionSource(organizationName, toIdOptions);
+}
+
+export function useUserNameOptions(organizationName: string): RemoteOptions {
+  return useUserOptionSource(organizationName, toNameOptions);
 }
 
 /**

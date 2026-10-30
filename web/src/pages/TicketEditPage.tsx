@@ -23,7 +23,7 @@ export default function TicketEditPage() {
     },
     {type: "text", name: "name", labelKey: "general:Name", required: true},
     {type: "text", name: "displayName", labelKey: "general:Display name"},
-    {type: "select", name: "user", labelKey: "general:User", options: () => users},
+    {type: "select", name: "user", labelKey: "general:User", options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "text", name: "title", labelKey: "general:Title"},
     {type: "textarea", name: "content", labelKey: "provider:Content", rows: 8},
     {type: "text", name: "createdTime", labelKey: "general:Created time", disabled: () => true},

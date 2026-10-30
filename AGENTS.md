@@ -123,7 +123,21 @@ scripts/       # 启停脚本
 - **验证**：`npx tsc --noEmit` 通过；浏览器实测 `/groups/test/%E4%BC%97...` 面包屑显示「众阳健康集团」。
 - **演变链**：`f13a408d`（旧前端修复）→ 合并 `0d1df1f8`（前端换壳，修复未移植）→ 本次回退修复（新前端）。
 
-### 3. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
+### 3. 用户下拉搜不到第一页之外的用户（服务端搜索 + 滚动翻页）— 2026-10-30 重写回退修复
+
+- **症状**：角色/权限等编辑页的「包含用户」多选搜索 `lizhiqiang` 显示「暂无数据」，但该用户真实存在（用户列表页同名服务端搜索可命中）；组织用户数超过 1000 时，第一页之外的任何用户都搜不到、选不中。
+- **根因**：shadcn 重写后 `web/src/hooks/use-options.ts` 的 `useUserOptions`/`useUserNameOptions` 只取 `get-users` 第一页（`PAGE_SIZE=1000`），`MultiSelect`/`SearchableSelect` 用 cmdk `filter` 纯客户端过滤；按 `created_time` 倒序排在第一页之外的用户永远进不了选项列表。旧 antd 前端此处是 `web-old/src/common/PaginateSelect.js` 的服务端搜索（`field=name`）+ `onPopupScroll` 滚动翻页，重写时语义丢失——与 §2 同属「前端换壳后旧前端能力/修复未移植」。
+- **修复**：hook 返回 `RemoteOptions {options, onSearch, onLoadMore, hasMore}`：输入防抖 300ms 走后端 `name`/`displayName` 双路 LIKE 搜索合并去重；下拉滚到底追加下一页（基础 1000/页、搜索 100/页）；ticket/seq 作废在途旧响应防竞态；关闭下拉重置回基础页；`MultiSelect`/`SearchableSelect` 新增 `onSearch`/`onLoadMore`/`hasMore`（远程模式跳过本地过滤）并以标签缓存保证已选徽章换页后不丢显示名；`SimpleEditPage` 的 select/multiselect 透传三 prop，接入 Role、Permission、Order、Pricing、Ticket、Transaction、Coupon、Subscription、Payment、Key 共 10 个编辑页；后端 `object/ormer_session.go` `GetSessionForUser` 分页分支在排序列后追加 `owner,name` 确定性 tiebreaker——LDAP 批量同步会给成千用户写同一秒 `created_time`，无 tiebreaker 时并列行在两次分页查询间顺序不保证，滚动翻页可能漏行（万人组织必现级风险）。
+- **验证**：`npx tsc --noEmit` 通过并重编前端；开发库注入 1008 用户（`lizhiqiang` 排在 1000 名外）浏览器实测：下拉打开 1000 项 → 滚到底自动增至 1008 项、搜索 `lizhiqiang` 命中 1 项可勾选；测试数据已清理。
+- **回归测试**：`object/user_pagination_tie_test.go`（同 `created_time` 120 用户倒序插入：分页无遗漏/无重叠、遍历序等于 tiebreaker 序、同页重复查询不漂移、搜索路径分页完整；移除 tiebreaker 后该测试立即失败）：
+
+  ```bash
+  CASDOOR_TEST_CONFIG=/msun/src/casdoor/conf/app-pg.conf go test ./object/ -run "TestPaginationUsersTieBreaker" -v
+  ```
+- **约定（防同类 BUG）**：新前端任何可能超过一页的长列表下拉（用户、群组、角色等）**禁止**「只加载单页 + 客户端过滤」模式，必须接服务端搜索/分页（`RemoteOptions` 模式）；移植旧 antd 页面时须逐项核对 `PaginateSelect`、`showSearch`、`onPopupScroll` 的服务端搜索语义，防止换壳丢失。
+- **演变链**：旧前端 `PaginateSelect`（服务端搜索 + 翻页）→ shadcn 重写（单页 + 客户端过滤，能力丢失）→ 本次修复（恢复服务端搜索 + 滚动翻页）。
+
+### 4. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
 |---|---|---|---|
@@ -138,3 +152,4 @@ scripts/       # 启停脚本
 | 面包屑 safeDecodeURIComponent 解码（CJK 组名不显示百分号编码） | `f13a408d`（2026-10-29 重新应用到新前端，见上文 §2） | `web/src/components/layout/BreadcrumbBar.tsx` + `web-old/src/common/BreadcrumbBar.js` | 在位 |
 | goroutine panic 打印调用堆栈 | `13cd8e59` | `util/routine.go` `SafeGoroutine` | 在位 |
 | 上游 web/web2 目录重命名适配（后端仅服务 `web/build`） | `c4591a5f` | `scripts/start_pg.sh` 等 | 在位 |
+| 用户下拉服务端搜索 + 滚动翻页（`RemoteOptions`，恢复 antd PaginateSelect 语义，见上文 §3） | 2026-10-30 本次修复 | `web/src/hooks/use-options.ts` + `web/src/components/common/MultiSelect.tsx`/`SearchableSelect.tsx` + `web/src/components/crud/SimpleEditPage.tsx` | 在位 |

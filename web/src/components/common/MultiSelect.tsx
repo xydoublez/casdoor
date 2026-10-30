@@ -32,6 +32,14 @@ interface MultiSelectProps {
   /** allow values that are not part of `options` (free tagging) */
   creatable?: boolean;
   maxDisplay?: number;
+  /**
+   * Server-side search: the parent replaces `options` with the backend matches,
+   * so the client-side filter is skipped and every keystroke is reported here.
+   */
+  onSearch?: (search: string) => void;
+  /** scrolling the list to its bottom loads the next page of a remote source */
+  onLoadMore?: () => void;
+  hasMore?: boolean;
 }
 
 /** Replacement for antd's `<Select mode="multiple" />`. */
@@ -44,13 +52,33 @@ export function MultiSelect({
   className,
   creatable = false,
   maxDisplay = 20,
+  onSearch,
+  onLoadMore,
+  hasMore = false,
 }: MultiSelectProps) {
   const [open, setOpen] = React.useState(false);
   const [search, setSearch] = React.useState("");
   const selected = value ?? [];
 
+  const handleListScroll = (event: React.SyntheticEvent<HTMLDivElement>) => {
+    if (!onLoadMore || !hasMore) {
+      return;
+    }
+    const list = event.currentTarget;
+    if (list.scrollHeight - list.scrollTop - list.clientHeight < 48) {
+      onLoadMore();
+    }
+  };
+
+  // `options` may be swapped for a page of search results, but the badges of
+  // already picked values still need their labels, so remember every label seen
+  const labelCache = React.useRef(new Map<string, React.ReactNode>());
+  React.useEffect(() => {
+    options.forEach((o) => labelCache.current.set(o.value, o.label));
+  }, [options]);
+
   const labelOf = React.useCallback(
-    (v: string) => options.find((o) => o.value === v)?.label ?? v,
+    (v: string) => options.find((o) => o.value === v)?.label ?? labelCache.current.get(v) ?? v,
     [options],
   );
 
@@ -66,7 +94,17 @@ export function MultiSelect({
     creatable && search.trim() !== "" && !options.some((o) => o.value === search.trim()) && !selected.includes(search.trim());
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) {
+          // a closed dropdown starts fresh: the base page, not stale matches
+          setSearch("");
+          onSearch?.("");
+        }
+      }}
+    >
       <PopoverTrigger asChild>
         <Button
           type="button"
@@ -110,14 +148,25 @@ export function MultiSelect({
       </PopoverTrigger>
       <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
         <Command
-          filter={(itemValue, searchValue) => {
-            const option = options.find((o) => o.value === itemValue);
-            const haystack = `${itemValue} ${option?.keywords ?? ""}`.toLowerCase();
-            return haystack.includes(searchValue.toLowerCase()) ? 1 : 0;
-          }}
+          filter={
+            onSearch
+              ? () => 1
+              : (itemValue, searchValue) => {
+                const option = options.find((o) => o.value === itemValue);
+                const haystack = `${itemValue} ${option?.keywords ?? ""}`.toLowerCase();
+                return haystack.includes(searchValue.toLowerCase()) ? 1 : 0;
+              }
+          }
         >
-          <CommandInput placeholder={i18next.t("general:Search")} value={search} onValueChange={setSearch} />
-          <CommandList>
+          <CommandInput
+            placeholder={i18next.t("general:Search")}
+            value={search}
+            onValueChange={(v) => {
+              setSearch(v);
+              onSearch?.(v);
+            }}
+          />
+          <CommandList onScroll={handleListScroll}>
             <CommandEmpty>{i18next.t("general:No data")}</CommandEmpty>
             <CommandGroup>
               {canCreate && (

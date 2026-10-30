@@ -86,16 +86,23 @@ func GetSessionForUser(owner string, offset, limit int, field, value, sortField,
 			session = session.Desc(util.CamelToSnakeCase(sortField))
 		}
 	} else {
+		// LDAP batch syncs stamp one created_time on thousands of users; without a
+		// deterministic tiebreaker the order of tied rows may differ between two
+		// paginated queries, and a row can fall out of every page
 		if sortOrder == "ascend" {
 			session = session.Alias("a").
 				Join("INNER", []string{tableName, "b"}, "a.owner = b.owner and a.name = b.name").
 				Select("b.*").
-				Asc("a." + util.CamelToSnakeCase(sortField))
+				Asc("a." + util.CamelToSnakeCase(sortField)).
+				Asc("a.owner").
+				Asc("a.name")
 		} else {
 			session = session.Alias("a").
 				Join("INNER", []string{tableName, "b"}, "a.owner = b.owner and a.name = b.name").
 				Select("b.*").
-				Desc("a." + util.CamelToSnakeCase(sortField))
+				Desc("a." + util.CamelToSnakeCase(sortField)).
+				Asc("a.owner").
+				Asc("a.name")
 		}
 	}
 
