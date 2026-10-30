@@ -310,7 +310,8 @@ start_and_verify() {
   info "端口 ${HTTP_PORT} 已监听。"
   if command -v curl >/dev/null; then
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HTTP_PORT}/api/health" || true)
+    # -m 限时：服务进程假死（端口在听但 HTTP 无响应）时 curl 会永远挂起，导致脚本"卡住"
+    code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HTTP_PORT}/api/health" || true)
     info "健康检查 /api/health -> HTTP ${code:-N/A}"
   fi
   systemctl --no-pager -l status "${SERVICE_NAME}" | head -n 12 || true
@@ -462,7 +463,8 @@ do_upgrade() {
   info "端口 ${HTTP_PORT} 已监听。"
   if command -v curl >/dev/null; then
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HTTP_PORT}/api/health" || true)
+    # -m 限时：服务进程假死（端口在听但 HTTP 无响应）时 curl 会永远挂起，导致脚本"卡住"
+    code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HTTP_PORT}/api/health" || true)
     info "健康检查 /api/health -> HTTP ${code:-N/A}"
   fi
   systemctl --no-pager -l status "${SERVICE_NAME}" | head -n 12 || true
