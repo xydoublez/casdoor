@@ -52,12 +52,25 @@ export type EditField =
   | (BaseField & {type: "textarea"; rows?: number; placeholder?: string})
   | (BaseField & {type: "switch"})
   | (BaseField & {type: "tags"; placeholder?: string})
-  | (BaseField & {type: "select"; options: (ctx: Ctx) => SearchableOption[]})
+  | (BaseField & {
+    type: "select";
+    options: (ctx: Ctx) => SearchableOption[];
+    /** server-side search, for lists too long to filter in the browser */
+    onSearch?: (search: string) => void;
+    /** scrolling the list to its bottom loads the next page of a remote source */
+    onLoadMore?: () => void;
+    hasMore?: boolean;
+  })
   | (BaseField & {
     type: "multiselect";
     options: (ctx: Ctx) => MultiSelectOption[];
     /** a predicate when only some records may invent their own values */
     creatable?: boolean | ((ctx: Ctx) => boolean);
+    /** server-side search, for lists too long to filter in the browser */
+    onSearch?: (search: string) => void;
+    /** scrolling the list to its bottom loads the next page of a remote source */
+    onLoadMore?: () => void;
+    hasMore?: boolean;
   })
   | (BaseField & {type: "code"; language?: string; height?: number})
   | (BaseField & {type: "custom"; render: (ctx: Ctx, update: (field: string, value: any) => void) => React.ReactNode});
@@ -285,6 +298,9 @@ export function SimpleEditPage({
           value={value ?? ""}
           onChange={(v) => set(v)}
           options={field.options(ctx)}
+          onSearch={field.onSearch}
+          onLoadMore={field.onLoadMore}
+          hasMore={field.hasMore}
         />
       );
       break;
@@ -296,6 +312,9 @@ export function SimpleEditPage({
           value={value ?? []}
           onChange={(v) => set(v)}
           options={field.options(ctx)}
+          onSearch={field.onSearch}
+          onLoadMore={field.onLoadMore}
+          hasMore={field.hasMore}
         />
       );
       break;

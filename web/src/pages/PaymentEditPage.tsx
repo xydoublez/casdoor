@@ -31,7 +31,7 @@ export default function PaymentEditPage() {
     {type: "text", name: "displayName", labelKey: "general:Display name"},
     {type: "select", name: "provider", labelKey: "general:Provider", options: () => providers},
     {type: "text", name: "type", labelKey: "general:Type"},
-    {type: "select", name: "user", labelKey: "general:User", options: () => users},
+    {type: "select", name: "user", labelKey: "general:User", options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "text", name: "productsDisplayName", labelKey: "general:Products"},
     {type: "text", name: "detail", labelKey: "general:Detail"},
     {type: "text", name: "tag", labelKey: "general:Tag"},

@@ -35,7 +35,7 @@ export default function SubscriptionEditPage() {
     {type: "text", name: "name", labelKey: "general:Name", required: true},
     {type: "text", name: "displayName", labelKey: "general:Display name"},
     {type: "text", name: "description", labelKey: "general:Description"},
-    {type: "select", name: "user", labelKey: "general:User", options: () => users},
+    {type: "select", name: "user", labelKey: "general:User", options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "select", name: "group", labelKey: "subscription:Group", options: () => groups},
     {type: "select", name: "plan", labelKey: "general:Plan", options: () => plans},
     {

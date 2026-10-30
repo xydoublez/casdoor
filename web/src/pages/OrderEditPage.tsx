@@ -26,7 +26,7 @@ export default function OrderEditPage() {
     {type: "text", name: "name", labelKey: "general:Name", required: true},
     {type: "text", name: "displayName", labelKey: "general:Display name"},
     {type: "multiselect", name: "products", labelKey: "general:Products", options: () => products},
-    {type: "select", name: "user", labelKey: "general:User", options: () => users},
+    {type: "select", name: "user", labelKey: "general:User", options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "text", name: "payment", labelKey: "general:Payment"},
     {
       type: "select",
