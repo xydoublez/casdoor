@@ -16,7 +16,10 @@ package routers
 
 import (
 	stdcontext "context"
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -30,10 +33,40 @@ const FileSessionProvider = "casdoor_file"
 
 const fileSessionGcInterval = time.Hour
 
+// fileSessionGcDeleteLimit caps how many expired session files one GC/cleanup run
+// removes, so a backlog cannot turn a single background run into an hours-long walk
+const fileSessionGcDeleteLimit = 20000
+
+// fileSessionCountThreshold is the session file count above which the directory is
+// considered backed up: synchronous GC walks fast-fail and a background cleaner
+// drains the directory in paced batches instead
+const fileSessionCountThreshold = 100000
+
+// fileSessionCheckTimeout bounds the startup directory inspection, so a slow or
+// huge session directory can never delay service startup: on timeout the check is
+// skipped (non-critical) and the conservative async-cleanup path is taken
+const fileSessionCheckTimeout = 2 * time.Second
+
+// fileSessionCleanInterval paces the background cleaner between deletion batches
+const fileSessionCleanInterval = time.Minute
+
+// walk stop sentinels: filepath.Walk aborts on the first error returned by the walk fn
+var (
+	errDeleteLimit  = errors.New("session gc delete limit reached")
+	errCountLimit   = errors.New("session count limit reached")
+	errCheckTimeout = errors.New("session check timeout")
+)
+
 // fileSessionProvider wraps beego's "file" provider so that a new session is only written to disk
 // once it holds data, instead of one file for every request that comes without a session cookie
 type fileSessionProvider struct {
 	session.Provider
+	savePath    string
+	maxLifetime int64
+
+	stateMu   sync.Mutex
+	overLimit bool // last inspection saw more than fileSessionCountThreshold files
+	cleaning  bool // a background cleaner goroutine is running
 }
 
 type lazySessionStore struct {
@@ -59,12 +92,199 @@ func (p *fileSessionProvider) SessionInit(ctx stdcontext.Context, maxLifetime in
 		return err
 	}
 
+	p.savePath = savePath
+	p.maxLifetime = maxLifetime
+
+	// Bounded, timed inspection of the session directory: runs off the startup
+	// path, so a huge/slow directory can never block boot (see startupCheck)
+	util.SafeGoroutine(p.startupCheck)
+
 	util.SafeGoroutine(func() {
 		for range time.Tick(fileSessionGcInterval) {
-			p.Provider.SessionGC(stdcontext.Background())
+			p.SessionGC(stdcontext.Background())
 		}
 	})
 	return nil
+}
+
+// startupCheck inspects the session directory at boot with a bounded, timed walk.
+// beego triggers SessionGC from a startup hook (server/web/hooks.go); with a
+// backlog of session files even a lock-free full walk burns minutes of IO right
+// at boot. Counting only up to the threshold (or until the check timeout) keeps
+// the inspection cheap, and a backed-up directory is handed to the background
+// cleaner instead of being drained inline.
+func (p *fileSessionProvider) startupCheck() {
+	if p.savePath == "" || p.maxLifetime <= 0 {
+		return
+	}
+
+	start := time.Now()
+	count, capped, timedOut := p.countSessions(fileSessionCountThreshold+1, fileSessionCheckTimeout)
+	took := time.Since(start)
+
+	switch {
+	case timedOut:
+		logs.Warn("session dir check under %s timed out after %s at %d files, skipping full count and scheduling async cleanup", p.savePath, took, count)
+		p.setOverLimit(true)
+		p.startAsyncClean()
+	case capped:
+		logs.Warn("session dir check found more than %d files under %s in %s, scheduling async cleanup", fileSessionCountThreshold, p.savePath, took)
+		p.setOverLimit(true)
+		p.startAsyncClean()
+	default:
+		logs.Info("session dir check: %d session files under %s, took %s", count, p.savePath, took)
+		p.setOverLimit(false)
+	}
+}
+
+// countSessions counts session files (directories excluded) until either limit
+// files are seen or timeout elapses, whichever comes first. Both bounds keep the
+// walk cheap even on directories with millions of entries.
+func (p *fileSessionProvider) countSessions(limit int, timeout time.Duration) (count int, capped bool, timedOut bool) {
+	deadline := time.Now().Add(timeout)
+	err := filepath.Walk(p.savePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		count++
+		if count >= limit {
+			return errCountLimit
+		}
+		if time.Now().After(deadline) {
+			return errCheckTimeout
+		}
+		return nil
+	})
+	switch err {
+	case errCountLimit:
+		return count, true, false
+	case errCheckTimeout:
+		return count, false, true
+	default:
+		// nil (exact count) or an unreadable/missing directory: report what was seen
+		return count, false, false
+	}
+}
+
+// deleteExpired removes session files older than maxLifetime without holding
+// beego's provider-wide lock (see SessionGC). It stops after limit deletions and
+// reports whether that cap was hit.
+func (p *fileSessionProvider) deleteExpired(limit int) (deleted int, capped bool) {
+	if p.savePath == "" || p.maxLifetime <= 0 {
+		return 0, false
+	}
+
+	deadline := time.Now().Unix() - p.maxLifetime
+	err := filepath.Walk(p.savePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if info.ModTime().Unix() >= deadline {
+			return nil
+		}
+		if os.Remove(path) != nil {
+			return nil
+		}
+		deleted++
+		if deleted >= limit {
+			return errDeleteLimit
+		}
+		return nil
+	})
+	if err != nil && err != errDeleteLimit {
+		logs.Error("session cleanup walk failed under %s, error: %s", p.savePath, err)
+		return deleted, false
+	}
+	return deleted, err == errDeleteLimit
+}
+
+// SessionGC replaces beego's FileProvider.SessionGC, which holds the provider-wide
+// lock for the whole filepath.Walk over the session directory. Every HTTP request
+// takes that same lock in SessionStart (SessionRead/SessionExist), so a large
+// session directory stalls all HTTP traffic for the entire walk — observed in
+// production as every request parked in FileProvider.SessionExist while the port
+// kept listening and no error was logged. beego also kicks this off once at server
+// start (server/web/hooks.go), which is why restarts hung immediately as well.
+// This implementation never takes the global lock, caps deletions per run, and
+// fast-fails while the directory is backed up: draining is then owned by the
+// paced background cleaner (startAsyncClean), so neither startup nor request
+// handling ever waits on a full-directory walk.
+func (p *fileSessionProvider) SessionGC(ctx stdcontext.Context) {
+	if p.savePath == "" || p.maxLifetime <= 0 {
+		return
+	}
+
+	if p.isOverLimit() {
+		p.startAsyncClean()
+		return
+	}
+
+	start := time.Now()
+	deleted, capped := p.deleteExpired(fileSessionGcDeleteLimit)
+	if deleted > 0 || capped {
+		logs.Info("SessionGC removed %d expired session files under %s in %s (capped=%v)", deleted, p.savePath, time.Since(start), capped)
+	}
+	if capped {
+		// deletion cap hit: a backlog is likely, hand draining to the paced cleaner
+		p.setOverLimit(true)
+		p.startAsyncClean()
+	}
+}
+
+func (p *fileSessionProvider) isOverLimit() bool {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.overLimit
+}
+
+func (p *fileSessionProvider) setOverLimit(over bool) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	p.overLimit = over
+}
+
+// startAsyncClean drains a backed-up session directory on its own goroutine:
+// each round deletes up to fileSessionGcDeleteLimit expired files, then re-counts
+// with the bounded check, until the directory is back under the threshold. Rounds
+// are paced by fileSessionCleanInterval. If a round finds nothing expired while
+// still over the threshold, the cleaner stops: the remaining files are live
+// sessions and deleting them would sign users out for no gain.
+func (p *fileSessionProvider) startAsyncClean() {
+	p.stateMu.Lock()
+	if p.cleaning {
+		p.stateMu.Unlock()
+		return
+	}
+	p.cleaning = true
+	p.stateMu.Unlock()
+
+	util.SafeGoroutine(func() {
+		defer func() {
+			p.stateMu.Lock()
+			p.cleaning = false
+			p.stateMu.Unlock()
+		}()
+
+		for {
+			start := time.Now()
+			deleted, _ := p.deleteExpired(fileSessionGcDeleteLimit)
+			count, capped, timedOut := p.countSessions(fileSessionCountThreshold+1, fileSessionCheckTimeout)
+			logs.Info("session async cleanup: removed %d expired files in %s, %d files seen under %s (capped=%v, timedOut=%v)", deleted, time.Since(start), count, p.savePath, capped, timedOut)
+
+			if !capped && !timedOut {
+				p.setOverLimit(false)
+				logs.Info("session dir back under %d files, async cleanup finished", fileSessionCountThreshold)
+				return
+			}
+			if deleted == 0 {
+				// nothing expired left to drain: stop instead of re-walking forever
+				p.setOverLimit(false)
+				logs.Warn("session async cleanup stopped with %d+ files under %s: no expired files left to remove", fileSessionCountThreshold, p.savePath)
+				return
+			}
+			time.Sleep(fileSessionCleanInterval)
+		}
+	})
 }
 
 func (p *fileSessionProvider) SessionRead(ctx stdcontext.Context, sid string) (session.Store, error) {
