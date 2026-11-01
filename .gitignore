@@ -59,3 +59,4 @@ web/build.log
 web-old/build.log
 __pycache__/
 .qoder/
+dist/
