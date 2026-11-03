@@ -46,20 +46,34 @@
     statusNode.style.color = isError ? "#b42318" : "#1f2937";
   }
 
-  function getReactCallbackOrigin() {
+  // In development vite serves the React app on :7001 while the backend keeps serving
+  // the built bundle on :8000, so the handover prefers the dev server and exercises
+  // unbuilt changes. When nothing listens there the probe fails and the handover stays
+  // on the origin that served this page, which serves the built bundle just as well.
+  function resolveReactOrigin() {
+    var devOrigin = null;
     if (window.location.port === "8000" && ["localhost", "127.0.0.1"].indexOf(window.location.hostname) !== -1) {
-      return window.location.protocol + "//" + window.location.hostname + ":7001";
+      devOrigin = window.location.protocol + "//" + window.location.hostname + ":7001";
     }
-
-    return window.location.origin;
+    if (devOrigin === null) {
+      return Promise.resolve(window.location.origin);
+    }
+    return fetch(devOrigin + "/@vite/client", {method: "HEAD", cache: "no-store"})
+      .then(function(res) {
+        return res.ok ? devOrigin : window.location.origin;
+      })
+      .catch(function() {
+        return window.location.origin;
+      });
   }
 
   function goToReactFallback() {
-    var url = new URL(window.location.href);
-    url.protocol = window.location.protocol;
-    url.host = new URL(getReactCallbackOrigin()).host;
-    url.searchParams.set(reactFallbackKey, "1");
-    window.location.replace(url.toString());
+    resolveReactOrigin().then(function(origin) {
+      var url = new URL(window.location.href);
+      url.host = new URL(origin).host;
+      url.searchParams.set(reactFallbackKey, "1");
+      window.location.replace(url.toString());
+    });
   }
 
   function storeReactFallbackPayload(payload) {
@@ -318,10 +332,12 @@
   }
 
   function goToConsentPage(applicationName, queryString) {
-    var url = new URL(getReactCallbackOrigin());
-    url.pathname = basePath + "/consent/" + encodeURIComponent(applicationName);
-    url.search = queryString || "";
-    window.location.replace(url.toString());
+    resolveReactOrigin().then(function(origin) {
+      var url = new URL(origin);
+      url.pathname = basePath + "/consent/" + encodeURIComponent(applicationName);
+      url.search = queryString || "";
+      window.location.replace(url.toString());
+    });
   }
 
   function shouldFallbackToReact(res) {
