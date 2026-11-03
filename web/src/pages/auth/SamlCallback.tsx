@@ -10,6 +10,7 @@ import * as ApplicationBackend from "@/backend/ApplicationBackend";
 import * as AuthBackend from "@/backend/AuthBackend";
 import * as Conf from "@/Conf";
 import * as Setting from "@/lib/setting";
+import {useAccount} from "@/hooks/use-account";
 
 /**
  * Landing page of a sign-in through an external SAML identity provider.
@@ -31,6 +32,7 @@ interface PendingMfa {
 export default function SamlCallback() {
   const location = useLocation();
   const navigate = useNavigate();
+  const {reload} = useAccount();
   const [msg, setMsg] = React.useState<string | null>(null);
   // The assertion is single-use, so the second factor is collected here rather
   // than by sending the user back to /login with the pending login dropped.
@@ -99,7 +101,9 @@ export default function SamlCallback() {
     const handleLogin = (res: any) => {
       if (responseType === "login") {
         Setting.showMessage("success", i18next.t("application:Logged in successfully"));
-        navigate(Setting.getFromLink());
+        // The console guards on the account, which is still the anonymous one this page
+        // was loaded with: navigating first bounces straight back to /login, so reload it
+        reload().then(() => navigate(Setting.getFromLink()));
       } else if (responseType === "code") {
         Setting.goToLink(
           `${redirectUri}?code=${encodeURIComponent(res.data)}&state=${encodeURIComponent(state)}${Setting.getOAuthIssuerParam()}`,

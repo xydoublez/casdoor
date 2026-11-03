@@ -11,6 +11,7 @@ import * as Util from "@/auth/Util";
 import * as ApplicationBackend from "@/backend/ApplicationBackend";
 import * as AuthBackend from "@/backend/AuthBackend";
 import * as Setting from "@/lib/setting";
+import {useAccount} from "@/hooks/use-account";
 
 /**
  * Landing page of the OAuth/OIDC/SAML/CAS round trip. It re-posts the provider's
@@ -83,6 +84,7 @@ interface PendingMfa {
 export default function AuthCallback() {
   const location = useLocation();
   const navigate = useNavigate();
+  const {reload} = useAccount();
   const [msg, setMsg] = React.useState<string | null>(null);
   const [saml, setSaml] = React.useState<{response: string; redirectUrl: string; relayState: string} | null>(null);
   // The provider's authorization code is single-use, so the second factor has to
@@ -202,7 +204,9 @@ export default function AuthCallback() {
 
       if (type === "login" || type === "device") {
         Setting.showMessage("success", i18next.t("application:Logged in successfully"));
-        navigate(Setting.getFromLink());
+        // The console guards on the account, which is still the anonymous one this page
+        // was loaded with: navigating first bounces straight back to /login, so reload it
+        reload().then(() => navigate(Setting.getFromLink()));
       } else if (type === "code") {
         const goToRedirectUrl = () => Util.sendOAuthResponse(oAuthParams, {code: res.data});
 
@@ -233,7 +237,7 @@ export default function AuthCallback() {
         if (oauth) {
           from += `?oauth=${oauth}`;
         }
-        navigate(from);
+        reload().then(() => navigate(from));
       } else if (type === "saml") {
         if (res.data2?.method === "POST") {
           setSaml({response: res.data, redirectUrl: res.data2.redirectUrl, relayState: oAuthParams.relayState});
