@@ -137,7 +137,17 @@ scripts/       # 启停脚本
 - **约定（防同类 BUG）**：新前端任何可能超过一页的长列表下拉（用户、群组、角色等）**禁止**「只加载单页 + 客户端过滤」模式，必须接服务端搜索/分页（`RemoteOptions` 模式）；移植旧 antd 页面时须逐项核对 `PaginateSelect`、`showSearch`、`onPopupScroll` 的服务端搜索语义，防止换壳丢失。
 - **演变链**：旧前端 `PaginateSelect`（服务端搜索 + 翻页）→ shadcn 重写（单页 + 客户端过滤，能力丢失）→ 本次修复（恢复服务端搜索 + 滚动翻页）。
 
-### 4. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
+### 4. 联合登录（钉钉扫码等）验证 MFA 后弹回登录页 — 2026-11-03 重写回退修复
+
+- **症状**：普通用户钉钉扫码登录，TOTP 验证通过后弹出「登录成功」toast，但页面仍停在登录界面，必须手动刷新（F5）才进入应用。每次必现；密码登录完全正常。
+- **根因**：社交/联合登录回跳 `/callback`，`web/src/pages/auth/AuthCallback.tsx` 的 `handleOAuth` 在 `type === "login"`（及 `link`）分支直接 `navigate(Setting.getFromLink())`。SPA 跳转不重载页面，`AccountProvider`（`web/src/hooks/use-account.tsx`）里的 `account` 仍是页面加载时的匿名 `null`；`App.tsx` 的 `RequireAuth` 见 `account === null` 立即 `<Navigate to="/login">` 把人弹回登录页——而 toast 已经弹出，观感即「提示登录成功却还在登录界面」。手动刷新会重新拉 `get-account`，账号就绪后 `LoginPage` 的 effect 再跳 `getFromLink()`，于是能进应用。密码登录不受影响：`LoginPage.handleLoginResult` 写的是 `reload().then(() => navigate(...))`，先刷新账号再跳转。旧 antd 前端 `web-old/src/App.js` 的 `onLoginSuccess()` → `this.getAccount()` 同样有这一步，shadcn 重写时丢失——与 §2/§3 同属「前端换壳后旧前端能力/修复未移植」。
+- **影响面**：不止钉钉。全仓仅 6 处调用登录 API，其中 `AuthCallback.tsx`（**所有**第三方扫码/社交登录：钉钉、微信、企业微信、飞书、GitHub、Google、Telegram 等，以及账户页绑定第三方的 `link` 流程）与 `SamlCallback.tsx`（外部 SAML IdP）都缺 `reload()`。触发条件是 `responseType === "login"`：从 Casdoor 自身登录页发起社交登录（state 里没有 `redirect_uri`），或 OAuth 应用的 `redirect_uri` 指回 Casdoor 自身（`isSelfRedirectUri`）。给外部应用发授权码的 code/token 流程走 `goToLink`（整页加载）不受影响——这解释了为何只有部分场景暴露。
+- **修复**：两个回调页在 SPA 跳转前先 `reload()` 刷新账号上下文，与 `LoginPage` 对齐；`goToLink`/`sendOAuthResponse`/`RedirectForm` 等整页跳转分支不动。`link` 分支同时修掉绑定成功后账号未刷新、页面看不到新绑定身份的问题。附带修复 `web/src/pages/auth/CasLogout.tsx`：`finish()` 原先 fire-and-forget 调 `reload()` 后就 `navigate()`，退出瞬间 CAS 登录页会闪现「使用当前账号登录」按钮；改为仅在 `navigate` 分支 await `reload()`（两个 `goToLink` 分支整页加载会自己拉账号，那次请求在导航中被丢弃，一并去掉）。
+- **验证**：`npx tsc --noEmit` 通过并重编前端。用本地 mock OAuth2 服务（`Custom` 类型 Provider 指向 `127.0.0.1:9100` 的 authorize/token/userinfo，userinfo 按 email 命中已绑 TOTP 的测试用户）驱动与钉钉**完全相同**的链路：`/login/torg` → 点 Provider 按钮 → `/callback?code=...` → 轻量静态页（`routers/lightweight_auth_filter.go` + `web/public/AuthCallbackHandler.js`）判定 `NextMfa` 并移交 React（URL 带 `__casdoor_callback_react=1`）→ MFA 界面 → 输入 TOTP。对照结果：**未修复**构建最终 URL `/login`、页面为登录表单；**修复后**最终 URL `/apps`、控制台侧栏显示已登录用户。服务端日志同步印证：未修复时 `API: [torg/dingtest] signed in` 之后**没有** `get-account` 请求；修复后紧跟一条 `GET /api/get-account`（即新增的 `reload()`）。mock 服务与 mock Provider 已删除，测试用户 `torg/dingtest`（已绑 TOTP）保留。
+- **约定（防同类 BUG）**：登录/登出/绑定等**改变会话状态**后要进入受 `RequireAuth` 保护的路由，禁止裸 `navigate()`，必须 `reload().then(() => navigate(...))`（或先 `setAccount()`），否则账号上下文仍是旧值、会被立刻弹回登录页。整页跳转（`Setting.goToLink`、`window.location.*`、表单 POST）不受此约束，因为它们本身会重新拉账号。移植旧 antd 页面时须逐项核对 `onLoginSuccess`/`getAccount` 的账号刷新语义。
+- **演变链**：旧前端 `App.onLoginSuccess()` → `getAccount()`（刷新账号后再进应用）→ shadcn 重写（`AuthCallback`/`SamlCallback` 直接 `navigate`，刷新语义丢失）→ 本次修复（跳转前 `reload()`）。
+
+### 5. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
 |---|---|---|---|
@@ -153,3 +163,5 @@ scripts/       # 启停脚本
 | goroutine panic 打印调用堆栈 | `13cd8e59` | `util/routine.go` `SafeGoroutine` | 在位 |
 | 上游 web/web2 目录重命名适配（后端仅服务 `web/build`） | `c4591a5f` | `scripts/start_pg.sh` 等 | 在位 |
 | 用户下拉服务端搜索 + 滚动翻页（`RemoteOptions`，恢复 antd PaginateSelect 语义，见上文 §3） | 2026-10-30 本次修复 | `web/src/hooks/use-options.ts` + `web/src/components/common/MultiSelect.tsx`/`SearchableSelect.tsx` + `web/src/components/crud/SimpleEditPage.tsx` | 在位 |
+| 联合登录/社交扫码（钉钉等）+ MFA 后跳转前刷新账号（恢复 antd `onLoginSuccess`→`getAccount` 语义，见上文 §4） | 2026-11-03 本次修复 | `web/src/pages/auth/AuthCallback.tsx` + `web/src/pages/auth/SamlCallback.tsx` | 在位 |
+| CAS 退出后先清空账号上下文再跳 CAS 登录页（避免闪现「使用当前账号登录」） | 2026-11-03 本次修复 | `web/src/pages/auth/CasLogout.tsx` `finish()` | 在位 |

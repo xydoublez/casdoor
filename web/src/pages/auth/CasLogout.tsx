@@ -23,13 +23,15 @@ export default function CasLogout() {
 
     const finish = (redirectUri?: string) => {
       Setting.showMessage("success", i18next.t("application:Logged out successfully"));
-      reload();
       if (redirectUri) {
         Setting.goToLink(redirectUri);
       } else if (search.get("service")) {
         Setting.goToLink(search.get("service") as string);
       } else {
-        navigate(`/cas/${owner}/${casApplicationName}/login`);
+        // The CAS login page offers "continue as the current account" while a signed-in
+        // account is still in context, so drop it before the in-page navigation. The two
+        // branches above load a whole page, which fetches the account itself.
+        reload().then(() => navigate(`/cas/${owner}/${casApplicationName}/login`));
       }
     };
 
