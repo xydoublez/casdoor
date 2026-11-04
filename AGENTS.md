@@ -147,6 +147,18 @@ scripts/       # 启停脚本
 - **约定（防同类 BUG）**：登录/登出/绑定等**改变会话状态**后要进入受 `RequireAuth` 保护的路由，禁止裸 `navigate()`，必须 `reload().then(() => navigate(...))`（或先 `setAccount()`），否则账号上下文仍是旧值、会被立刻弹回登录页。整页跳转（`Setting.goToLink`、`window.location.*`、表单 POST）不受此约束，因为它们本身会重新拉账号。移植旧 antd 页面时须逐项核对 `onLoginSuccess`/`getAccount` 的账号刷新语义。
 - **演变链**：旧前端 `App.onLoginSuccess()` → `getAccount()`（刷新账号后再进应用）→ shadcn 重写（`AuthCallback`/`SamlCallback` 直接 `navigate`，刷新语义丢失）→ 本次修复（跳转前 `reload()`）。
 
+### 6. 日志页按用户名搜索恒为空（PG 保留字 `user` 未加引号）— 2026-11-04 修复
+
+- **症状**：日志页（`/records`）「用户」列过滤输入用户名（如 `yaozhen2`）恒为「暂无数据」（0/0），其余列搜索正常；令牌、会话等一切经 `GetSession` 按 `user` 列搜索的列表页同样受影响。
+- **根因**：`object/ormer_session.go` 的 `GetSession()`/`GetSessionForUser()` 用 `session.And(fmt.Sprintf("%s like ?", ...))` 拼**裸 SQL** 条件；`user` 是 PostgreSQL 保留字，不加引号时被解析为会话用户（`CURRENT_USER`），条件恒假、静默零行。同文件的 `quoteColumn()` 即为此起草且全仓 15+ 处已在用，唯独这两个通用 session 构造器漏掉；xorm 的 `Asc/Desc` 内部会经 Quoter 加引号，故排序不受影响，仅搜索条件中招。
+- **修复**：两个函数的 like 条件列名统一过 `quoteColumn()`（带 `a.` 别名前缀的点号形式也安全：xorm Quoter 对点号分段逐段加引号，得 `a."user"`）。
+- **回归测试**：`object/record_user_search_test.go`（插入临时 record 后断言 `field=user` 的 count 与分页两路均命中、不存在用户名计 0；未修复代码下 count=0 立即失败）：
+
+  ```bash
+  CASDOOR_TEST_CONFIG=/msun/src/casdoor/conf/app-pg.conf go test ./object/ -run "TestRecordSearchByUser" -v
+  ```
+- **约定（防同类 BUG）**：凡往 `session.And/Where/In` 等**裸 SQL 条件**里拼列名，必须过 `quoteColumn()`；PG 保留字（`user`、`group`、`order` 等）裸拼不报错而是静默错义。排序列交给 xorm `Asc/Desc` 即可（内部已加引号）。
+
 ### 5. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
@@ -165,3 +177,4 @@ scripts/       # 启停脚本
 | 用户下拉服务端搜索 + 滚动翻页（`RemoteOptions`，恢复 antd PaginateSelect 语义，见上文 §3） | 2026-10-30 本次修复 | `web/src/hooks/use-options.ts` + `web/src/components/common/MultiSelect.tsx`/`SearchableSelect.tsx` + `web/src/components/crud/SimpleEditPage.tsx` | 在位 |
 | 联合登录/社交扫码（钉钉等）+ MFA 后跳转前刷新账号（恢复 antd `onLoginSuccess`→`getAccount` 语义，见上文 §4） | 2026-11-03 本次修复 | `web/src/pages/auth/AuthCallback.tsx` + `web/src/pages/auth/SamlCallback.tsx` | 在位 |
 | CAS 退出后先清空账号上下文再跳 CAS 登录页（避免闪现「使用当前账号登录」） | 2026-11-03 本次修复 | `web/src/pages/auth/CasLogout.tsx` `finish()` | 在位 |
+| 日志/令牌/会话等列表按 `user` 等 PG 保留字列搜索恒空（裸 SQL 条件列名过 `quoteColumn`，见上文 §6） | 2026-11-04 本次修复 | `object/ormer_session.go` `GetSession`/`GetSessionForUser` | 在位 |
