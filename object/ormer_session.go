@@ -39,7 +39,10 @@ func GetSession(owner string, offset, limit int, field, value, sortField, sortOr
 	}
 	if field != "" && value != "" {
 		if util.FilterField(field) {
-			session = session.And(fmt.Sprintf("%s like ?", util.CamelToSnakeCase(field)), fmt.Sprintf("%%%s%%", value))
+			// the condition is raw SQL, so reserved words like "user" must be
+			// quoted: left bare, PostgreSQL resolves them to the session user
+			// and the condition silently matches nothing
+			session = session.And(fmt.Sprintf("%s like ?", quoteColumn(util.CamelToSnakeCase(field))), fmt.Sprintf("%%%s%%", value))
 		}
 	}
 	if sortField == "" || sortOrder == "" || !util.FilterField(sortField) {
@@ -67,10 +70,11 @@ func GetSessionForUser(owner string, offset, limit int, field, value, sortField,
 	}
 	if field != "" && value != "" {
 		if util.FilterField(field) {
+			column := util.CamelToSnakeCase(field)
 			if offset != -1 {
-				field = fmt.Sprintf("a.%s", field)
+				column = fmt.Sprintf("a.%s", column)
 			}
-			session = session.And(fmt.Sprintf("%s like ?", util.CamelToSnakeCase(field)), fmt.Sprintf("%%%s%%", value))
+			session = session.And(fmt.Sprintf("%s like ?", quoteColumn(column)), fmt.Sprintf("%%%s%%", value))
 		}
 	}
 	if sortField == "" || sortOrder == "" || !util.FilterField(sortField) {
