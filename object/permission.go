@@ -353,6 +353,19 @@ func deletePermission(permission *Permission) (bool, error) {
 }
 
 func DeletePermission(permission *Permission) (bool, error) {
+	// /api/delete-permission forwards the posted body as-is, and an API client commonly posts
+	// only {owner, name}. removePolicies() derives the Casbin rules from the subjects, resources
+	// and actions of the object it is handed, so a partial one would drop the row and leave its
+	// rules behind, still matching in every enforcer that shares the model and adapter. Remove
+	// what the stored row declared, the same way UpdatePermission() uses oldPermission.
+	storedPermission, err := getPermission(permission.Owner, permission.Name)
+	if err != nil {
+		return false, err
+	}
+	if storedPermission != nil {
+		permission = storedPermission
+	}
+
 	affected, err := deletePermission(permission)
 	if err != nil {
 		return false, err
