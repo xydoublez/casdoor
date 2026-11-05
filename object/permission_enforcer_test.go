@@ -63,3 +63,38 @@ func TestGetPoliciesIncludesGroupsWithDomains(t *testing.T) {
 		t.Fatalf("getPolicies() = %#v, want %#v", got, want)
 	}
 }
+
+// TestDeletePermissionWithPartialObjectRemovesPolicies — /api/delete-permission forwards whatever
+// the client posted, and an API client commonly posts only {owner, name}. The Casbin rules are
+// derived from the object, so deleting with a partial one used to leave them behind, where they
+// keep matching for the enforcers sharing the model and adapter.
+func TestDeletePermissionWithPartialObjectRemovesPolicies(t *testing.T) {
+	owner := "perm-del-" + randomSuffix(t)
+	setupGroupAuthTest(t, owner)
+
+	permission := makeAllowPermission(owner, "perm-1", []string{owner + "/dev"})
+	addPermission(t, permission)
+
+	id := permission.GetId()
+	if count := countPermissionPolicies(t, id); count == 0 {
+		t.Fatalf("AddPermission(%s) wrote no Casbin policy", id)
+	}
+
+	affected, err := DeletePermission(&Permission{Owner: owner, Name: permission.Name})
+	mustErr(t, err)
+	if !affected {
+		t.Fatalf("DeletePermission(%s) not affected", id)
+	}
+
+	if count := countPermissionPolicies(t, id); count != 0 {
+		t.Fatalf("%d Casbin policies of %s survived the deletion", count, id)
+	}
+}
+
+func countPermissionPolicies(t *testing.T, permissionId string) int64 {
+	t.Helper()
+
+	count, err := ormer.Engine.Table("permission_rule").Where("v5 = ?", permissionId).Count()
+	mustErr(t, err)
+	return count
+}

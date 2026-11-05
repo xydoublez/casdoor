@@ -38,6 +38,7 @@ mkdir -p logs tmp
 - 不使用 `app.conf`，不修改 `app.conf`
 - `RUN_USER=sfx` 表示以当前用户运行，无需 sudo 创建专用用户
 - 日志输出到控制台（`logConfig = {"adapter":"console"}`）
+- 全新库首次启动时 `built-in/admin` 无密码，需在 `/init-admin` 欢迎页设置。built-in 组织出厂即带 `PasswordOptions = ["AtLeast6"]`（`object/init.go`），欢迎页与 `SetInitAdminPassword()` 双重校验都会拒绝 `123`；`admin / 123` 只在 demo 模式或启动前预置 `initAdminPassword` 时成立（`getInitAdminPassword()`）
 
 ### 环境变量（可选覆盖）
 
@@ -107,10 +108,10 @@ scripts/       # 启停脚本
 - **症状**：权限/角色绑定在父组（如 `AI中台部`）时，只属于其子组（如 `AI医疗专家组`）的用户（如 `test/liuyangyang`）拿不到授权；`getPermissionsAndRolesByUser()` 不返回父组权限，导致用户页权限列表与 `GetAllObjects/GetAllActions`（前端菜单/资源可见性）全部缺失。
 - **根因**：上游合并 `0d1df1f8`（2026-10-27）重写了 `object/permission.go` 的 `getPermissionsAndRolesByUser()`（引入 SourceGroups/SourceRoles 跟踪），重写后的按组收集循环只遍历 `user.Groups`（直接所属组），未继承本地提交 `d89cd51f`（2026-10-27，"enforce group hierarchy in permission checks"）建立的父组覆盖语义——该提交修复的 `isGroupHit`、`getRolesByUserInternal`、运行时分组策略三处在合并中幸存，但此函数被上游版本取代后症状重新暴露。
 - **修复**：在 `getPermissionsAndRolesByUser()` 收集组绑定权限前，先用 `GetGroupIdsWithAncestors()`（`object/group.go`，`d89cd51f` 引入，带 per-owner 缓存 + 写失效 + 10s TTL）展开祖先组。
-- **回归测试**：`object/parent_group_auth_test.go`（真实数据：组织 `test`，父组 `AI中台部` → 子组 `AI医疗专家组`，用户 `liuyangyang`/`chenyipeng`）：
+- **回归测试**：`object/parent_group_auth_test.go`（三个用例各自创建一次性组织，无需真实数据；早期依赖组织 `test` 真实数据的 `-run "RealData"` 用例已不在仓库中）：
 
   ```bash
-  CASDOOR_TEST_CONFIG=/msun/src/casdoor/conf/app-pg.conf go test ./object/ -run "RealData" -v
+  CASDOOR_TEST_CONFIG=/msun/src/casdoor/conf/app-pg.conf go test ./object/ -run "TestParentGroupAuthWithOUHierarchy|TestNestedGroupAuth|TestMixedHierarchy" -v
   ```
 
 - **演变链**：`13cd8e59`（组层级初版）→ `d89cd51f`（完整修复）→ 合并 `0d1df1f8`（语义被上游重写覆盖）→ 本次回退修复。
@@ -147,7 +148,7 @@ scripts/       # 启停脚本
 - **约定（防同类 BUG）**：登录/登出/绑定等**改变会话状态**后要进入受 `RequireAuth` 保护的路由，禁止裸 `navigate()`，必须 `reload().then(() => navigate(...))`（或先 `setAccount()`），否则账号上下文仍是旧值、会被立刻弹回登录页。整页跳转（`Setting.goToLink`、`window.location.*`、表单 POST）不受此约束，因为它们本身会重新拉账号。移植旧 antd 页面时须逐项核对 `onLoginSuccess`/`getAccount` 的账号刷新语义。
 - **演变链**：旧前端 `App.onLoginSuccess()` → `getAccount()`（刷新账号后再进应用）→ shadcn 重写（`AuthCallback`/`SamlCallback` 直接 `navigate`，刷新语义丢失）→ 本次修复（跳转前 `reload()`）。
 
-### 6. 日志页按用户名搜索恒为空（PG 保留字 `user` 未加引号）— 2026-11-04 修复
+### 5. 日志页按用户名搜索恒为空（PG 保留字 `user` 未加引号）— 2026-11-04 修复
 
 - **症状**：日志页（`/records`）「用户」列过滤输入用户名（如 `yaozhen2`）恒为「暂无数据」（0/0），其余列搜索正常；令牌、会话等一切经 `GetSession` 按 `user` 列搜索的列表页同样受影响。
 - **根因**：`object/ormer_session.go` 的 `GetSession()`/`GetSessionForUser()` 用 `session.And(fmt.Sprintf("%s like ?", ...))` 拼**裸 SQL** 条件；`user` 是 PostgreSQL 保留字，不加引号时被解析为会话用户（`CURRENT_USER`），条件恒假、静默零行。同文件的 `quoteColumn()` 即为此起草且全仓 15+ 处已在用，唯独这两个通用 session 构造器漏掉；xorm 的 `Asc/Desc` 内部会经 Quoter 加引号，故排序不受影响，仅搜索条件中招。
@@ -159,7 +160,20 @@ scripts/       # 启停脚本
   ```
 - **约定（防同类 BUG）**：凡往 `session.And/Where/In` 等**裸 SQL 条件**里拼列名，必须过 `quoteColumn()`；PG 保留字（`user`、`group`、`order` 等）裸拼不报错而是静默错义。排序列交给 xorm `Asc/Desc` 即可（内部已加引号）。
 
-### 5. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
+### 6. 删除权限只带 owner/name 时残留 Casbin 策略 — 2026-11-05 修复
+
+- **症状**：`POST /api/delete-permission` 只提交 `{"owner","name"}`（SDK/脚本常见写法）时，权限行被删除，但 `permission_rule` 表里该权限的 `p` 策略仍在（`v5` = 权限 ID）。前端删除不受影响，因为 UI 提交整条记录。
+- **根因**：`object/permission.go` `DeletePermission()` 把控制器反序列化出的请求体对象直接交给 `removePolicies()`，而 `getPolicies()`（`object/permission_enforcer.go`）由对象的 `Users/Groups/Roles × Resources × Actions`（含 `Domains`/`Effect`）推导待删策略；字段缺失即推导出空列表，`enforcer.RemovePolicies([])` 一行也不删。策略按 `Model`+`Adapter` 共享 enforcer，残留行会继续参与同 model/adapter 下其他权限的判定。
+- **修复**：`DeletePermission()` 先用 `getPermission(owner, name)` 回读库中完整对象（含 `Model`/`Adapter`），以它执行删行与 `removePolicies()`，与 `UpdatePermission()` 使用 `oldPermission` 的写法一致；请求体只需给出 owner/name。
+- **回归测试**：`object/permission_enforcer_test.go` `TestDeletePermissionWithPartialObjectRemovesPolicies`（自建一次性组织：`AddPermission` 后断言 `permission_rule` 有行，用部分对象 `DeletePermission` 后断言归零；回退修复即失败）：
+
+  ```bash
+  CASDOOR_TEST_CONFIG=/msun/src/casdoor/conf/app-pg.conf go test ./object/ -run "TestDeletePermissionWithPartialObjectRemovesPolicies" -v
+  ```
+- **验证**：HTTP 层实测（组织/应用/群组/权限齐备后 `POST /api/delete-permission` 仅带 owner+name）：删除前 `permission_rule` 1 行 → 删除后 0 行。
+- **约定（防同类 BUG）**：凡是「删主对象 + 按对象字段派生清理」的函数（Casbin p/g 行、enforcer 规则、关联策略等），禁止信任请求体对象的完整性，必须先按 ID 回读库中对象再派生清理。
+
+### 7. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
 |---|---|---|---|
@@ -177,4 +191,5 @@ scripts/       # 启停脚本
 | 用户下拉服务端搜索 + 滚动翻页（`RemoteOptions`，恢复 antd PaginateSelect 语义，见上文 §3） | 2026-10-30 本次修复 | `web/src/hooks/use-options.ts` + `web/src/components/common/MultiSelect.tsx`/`SearchableSelect.tsx` + `web/src/components/crud/SimpleEditPage.tsx` | 在位 |
 | 联合登录/社交扫码（钉钉等）+ MFA 后跳转前刷新账号（恢复 antd `onLoginSuccess`→`getAccount` 语义，见上文 §4） | 2026-11-03 本次修复 | `web/src/pages/auth/AuthCallback.tsx` + `web/src/pages/auth/SamlCallback.tsx` | 在位 |
 | CAS 退出后先清空账号上下文再跳 CAS 登录页（避免闪现「使用当前账号登录」） | 2026-11-03 本次修复 | `web/src/pages/auth/CasLogout.tsx` `finish()` | 在位 |
-| 日志/令牌/会话等列表按 `user` 等 PG 保留字列搜索恒空（裸 SQL 条件列名过 `quoteColumn`，见上文 §6） | 2026-11-04 本次修复 | `object/ormer_session.go` `GetSession`/`GetSessionForUser` | 在位 |
+| 日志/令牌/会话等列表按 `user` 等 PG 保留字列搜索恒空（裸 SQL 条件列名过 `quoteColumn`，见上文 §5） | 2026-11-04 本次修复 | `object/ormer_session.go` `GetSession`/`GetSessionForUser` | 在位 |
+| 删除权限先回读库中完整对象再清理 Casbin 策略（请求体只带 owner/name 也不再残留 `permission_rule` 行，见上文 §6） | 2026-11-05 本次修复 | `object/permission.go` `DeletePermission` | 在位 |
