@@ -173,7 +173,26 @@ scripts/       # 启停脚本
 - **验证**：HTTP 层实测（组织/应用/群组/权限齐备后 `POST /api/delete-permission` 仅带 owner+name）：删除前 `permission_rule` 1 行 → 删除后 0 行。
 - **约定（防同类 BUG）**：凡是「删主对象 + 按对象字段派生清理」的函数（Casbin p/g 行、enforcer 规则、关联策略等），禁止信任请求体对象的完整性，必须先按 ID 回读库中对象再派生清理。
 
-### 7. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
+### 7. 钉钉扫码登录「绑定后」恒报账户不存在且不允许注册 — 2026-11-05 修复
+
+- **症状**：用户经钉钉同步器同步或在个人页绑定后，扫码登录恒报「提供商账户: DingTalk 与用户名: \<unionid\> (姓名) 不存在且 不允许注册新账户, 请联系IT支持」；密码登录正常；用户页「第三方登录」显示已绑定。
+- **根因**（两条叠加，任一单独即产生该症状）：
+  1. **绑定列 ID 语义错位**：`object/syncer_dingtalk.go` `dingtalkUserToOriginalUser()` 把钉钉企业 **userid** 写入用户 `dingtalk` 列（`object/syncer_user.go` 将 `dingtalk` 列加入同步列，注释即 "enable login binding"）；而扫码 OAuth（`idp/dingtalk.go`）的列查找用 **OpenId**（`userInfo.Id = OpenId`）。两者永不相等 → 列查找恒 miss；其后绑定规则兜底也同时落空（Phone 规则要求 `country_code` 精确匹配，同步用户 country_code 为空；Email 规则在企业邮箱为空时失效）→ 落入「不存在且不允许注册」分支。
+  2. **共享应用组织范围缺失**：`getUserByProvider()`/`getExistUserByBindingRule()` 只搜 `application.Organization`（共享应用恒属 built-in，无真实用户），而密码登录有 `GetUserByFieldsForSharedApp()` 的跨组织回退；绑定列写在用户真实组织，共享应用扫码登录永远找不到。
+- **修复**：
+  - `idp/provider.go` `UserInfo` 新增 `CorpUserId`；`idp/dingtalk.go` `GetUserInfo()` 将内部已解析的企业 userid 存入；`controllers/auth.go` 新增 `providerLoginIds()`：钉钉绑定列查找接受 OpenId + 企业 userid 双候选（UI 绑定的 OpenId 仍走主候选；link 流程重复检查同用双候选，防止绑到已被同步器绑定的账户）。
+  - `controllers/auth.go` 新增 `providerLookupOrganizations()`：共享应用把 provider 查找（绑定列/绑定规则/link 重复检查）扩展到「应用自身组织 + 所有以它为 default_application 的组织」，与密码登录对齐；命中后 `SetUserOAuthProperties`/`checkMfaEnable` 改用**用户所属组织**的设置（防止共享应用绕过用户组织的 MFA 策略）。
+  - `object/user_util.go` 抽出 `GetSharedApplicationOrganizations()`，`GetUserByFieldsForSharedApp()` 复用。
+- **回归测试**：
+  - `controllers/auth_dingtalk_binding_test.go` `TestDingTalkSyncerBindingColumnLogin`（同步 userid 列与 UI 绑定 OpenId 列均命中、未知账户不命中；移除 CorpUserId 候选立即失败）。
+  - `controllers/auth_shared_app_test.go` `TestSharedAppProviderLoginFindsLinkedUser` / `TestSharedAppBindingRuleFindsUser`（共享应用跨组织命中；非共享应用、非 default 组织不越界；移除共享扩展立即失败）。
+
+  ```bash
+  CASDOOR_TEST_CONFIG=/msun/src/casdoor/conf/app-pg.conf go test ./controllers/ -run "TestDingTalkSyncerBindingColumnLogin|TestSharedApp" -v
+  ```
+- **约定（防同类 BUG）**：API 型同步器（DingTalk/WeCom/Lark）写入绑定列的 ID 种类必须与对应 idp 的 `userInfo.Id` 语义对齐；无法对齐时（如钉钉同步器拿不到 per-app OpenId），登录查找必须接受同步器写入的 ID 作为候选。provider 登录的任何用户查找都必须与密码登录共享同一组织范围（含共享应用扩展）。
+
+### 8. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
 |---|---|---|---|
@@ -193,3 +212,4 @@ scripts/       # 启停脚本
 | CAS 退出后先清空账号上下文再跳 CAS 登录页（避免闪现「使用当前账号登录」） | 2026-11-03 本次修复 | `web/src/pages/auth/CasLogout.tsx` `finish()` | 在位 |
 | 日志/令牌/会话等列表按 `user` 等 PG 保留字列搜索恒空（裸 SQL 条件列名过 `quoteColumn`，见上文 §5） | 2026-11-04 本次修复 | `object/ormer_session.go` `GetSession`/`GetSessionForUser` | 在位 |
 | 删除权限先回读库中完整对象再清理 Casbin 策略（请求体只带 owner/name 也不再残留 `permission_rule` 行，见上文 §6） | 2026-11-05 本次修复 | `object/permission.go` `DeletePermission` | 在位 |
+| 钉钉扫码登录绑定后恒报账户不存在（同步器写 userid 到绑定列 vs OAuth 按 OpenId 查；provider 登录缺共享应用组织范围，见上文 §7） | 2026-11-05 本次修复 | `idp/dingtalk.go` + `idp/provider.go` `UserInfo.CorpUserId` + `controllers/auth.go` `providerLoginIds`/`providerLookupOrganizations` + `object/user_util.go` `GetSharedApplicationOrganizations` | 在位 |

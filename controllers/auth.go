@@ -652,6 +652,32 @@ func checkMfaEnable(c *ApiController, user *object.User, organization *object.Or
 	return c.promptMfaSetup(user, organization)
 }
 
+// providerLookupOrganizations returns the organizations in which a provider (OAuth /
+// SAML) login may resolve users of the given application: the application's own
+// organization plus, for a shared application, every organization that has it as
+// default application — the same set the password login searches via
+// object.GetUserByFieldsForSharedApp. A shared application belongs to "built-in",
+// which holds no real users, so without this expansion a user linked to a
+// third-party account in their own organization is invisible to the shared
+// application's QR / OAuth login and is told the provider account "does not exist".
+func providerLookupOrganizations(application *object.Application) ([]string, error) {
+	organizations := []string{application.Organization}
+	if !application.IsShared {
+		return organizations, nil
+	}
+
+	names, err := object.GetSharedApplicationOrganizations(application.Name)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		if name != application.Organization {
+			organizations = append(organizations, name)
+		}
+	}
+	return organizations, nil
+}
+
 func getExistUserByBindingRule(providerItem *object.ProviderItem, application *object.Application, userInfo *idp.UserInfo) (user *object.User, err error) {
 	if providerItem.BindingRule == nil {
 		providerItem.BindingRule = &[]string{"Email", "Phone"}
@@ -660,41 +686,48 @@ func getExistUserByBindingRule(providerItem *object.ProviderItem, application *o
 		return nil, nil
 	}
 
-	for _, rule := range *providerItem.BindingRule {
-		// Find existing user with Email, only one the provider vouches for: a provider
-		// account with someone else's unverified email must not take over their account
-		if rule == "Email" && userInfo.EmailVerified {
-			user, err = object.GetUserByField(application.Organization, "email", userInfo.Email)
-			if err != nil {
-				return nil, err
-			}
-			if user != nil && isEmailBindable(user) {
-				return user, nil
-			}
-		}
+	organizations, err := providerLookupOrganizations(application)
+	if err != nil {
+		return nil, err
+	}
 
-		// Find existing user with phone number, only one the provider vouches for, like the email
-		if rule == "Phone" && userInfo.PhoneVerified {
-			user, err = object.GetUserByPhoneAndCountryCode(application.Organization, userInfo.Phone, userInfo.CountryCode)
-			if err != nil {
-				return nil, err
+	for _, organization := range organizations {
+		for _, rule := range *providerItem.BindingRule {
+			// Find existing user with Email, only one the provider vouches for: a provider
+			// account with someone else's unverified email must not take over their account
+			if rule == "Email" && userInfo.EmailVerified {
+				user, err = object.GetUserByField(organization, "email", userInfo.Email)
+				if err != nil {
+					return nil, err
+				}
+				if user != nil && isEmailBindable(user) {
+					return user, nil
+				}
 			}
-			if user != nil {
-				return user, nil
-			}
-		}
 
-		// Try to find existing user by username (case-insensitive)
-		// This allows OAuth providers (e.g., Wecom) to automatically associate with
-		// existing users when usernames match, particularly useful for enterprise
-		// scenarios where signup is disabled and users already exist in Casdoor
-		if rule == "Name" {
-			user, err = object.GetUserByName(application.Organization, userInfo.Username)
-			if err != nil {
-				return nil, err
+			// Find existing user with phone number, only one the provider vouches for, like the email
+			if rule == "Phone" && userInfo.PhoneVerified {
+				user, err = object.GetUserByPhoneAndCountryCode(organization, userInfo.Phone, userInfo.CountryCode)
+				if err != nil {
+					return nil, err
+				}
+				if user != nil {
+					return user, nil
+				}
 			}
-			if user != nil {
-				return user, nil
+
+			// Try to find existing user by username (case-insensitive)
+			// This allows OAuth providers (e.g., Wecom) to automatically associate with
+			// existing users when usernames match, particularly useful for enterprise
+			// scenarios where signup is disabled and users already exist in Casdoor
+			if rule == "Name" {
+				user, err = object.GetUserByName(organization, userInfo.Username)
+				if err != nil {
+					return nil, err
+				}
+				if user != nil {
+					return user, nil
+				}
 			}
 		}
 	}
@@ -706,21 +739,42 @@ func isEmailBindable(user *object.User) bool {
 	return user.EmailVerified || user.RegisterType != "Application Signup"
 }
 
-func getUserByProvider(organization string, provider *object.Provider, providerId string) (*object.User, error) {
-	if object.IsFlexibleCustomProvider(provider.Type) {
-		return object.GetUserByThirdPartyLink(organization, provider.Name, providerId)
+// providerLoginIds returns the provider account ids a sign-in may resolve the
+// binding column by. The DingTalk syncer links synced users with the corporate
+// userid it reads from the DingTalk API, while the QR-code OAuth flow identifies
+// the same person by OpenId — without both candidates a synced (or previously
+// linked) user is told the provider account "does not exist".
+func providerLoginIds(provider *object.Provider, userInfo *idp.UserInfo) []string {
+	ids := []string{userInfo.Id}
+	if provider.Type == "DingTalk" && userInfo.CorpUserId != "" && userInfo.CorpUserId != userInfo.Id {
+		ids = append(ids, userInfo.CorpUserId)
 	}
-	if provider.Category == "SAML" {
-		return object.GetUserByFields(organization, providerId)
+	return ids
+}
+
+func getUserByProvider(application *object.Application, provider *object.Provider, userInfo *idp.UserInfo) (*object.User, error) {
+	organizations, err := providerLookupOrganizations(application)
+	if err != nil {
+		return nil, err
 	}
 
-	user, err := object.GetUserByField(organization, provider.Type, providerId)
-	if err != nil || user != nil {
-		return user, err
-	}
-
-	if provider.Type == "WeCom" && provider.SubType == "Internal" {
-		return object.GetUserByFieldIgnoreCase(organization, provider.Type, providerId)
+	for _, organization := range organizations {
+		for _, providerId := range providerLoginIds(provider, userInfo) {
+			var user *object.User
+			if object.IsFlexibleCustomProvider(provider.Type) {
+				user, err = object.GetUserByThirdPartyLink(organization, provider.Name, providerId)
+			} else if provider.Category == "SAML" {
+				user, err = object.GetUserByFields(organization, providerId)
+			} else {
+				user, err = object.GetUserByField(organization, provider.Type, providerId)
+				if err == nil && user == nil && provider.Type == "WeCom" && provider.SubType == "Internal" {
+					user, err = object.GetUserByFieldIgnoreCase(organization, provider.Type, providerId)
+				}
+			}
+			if err != nil || user != nil {
+				return user, err
+			}
+		}
 	}
 	return nil, nil
 }
@@ -1159,7 +1213,7 @@ func (c *ApiController) Login() {
 					return
 				}
 			} else if provider.Category == "OAuth" || object.IsFlexibleCustomProvider(provider.Type) {
-				user, err = getUserByProvider(application.Organization, provider, userInfo.Id)
+				user, err = getUserByProvider(application, provider, userInfo)
 				if err != nil {
 					c.ResponseError(err.Error())
 					return
@@ -1167,15 +1221,31 @@ func (c *ApiController) Login() {
 			}
 
 			if user != nil && !user.IsDeleted {
+				// a shared application resolves users outside its own (built-in)
+				// organization; like password login, their MFA policy and organization
+				// settings are the ones of the organization they belong to
+				userOrganization := organization
+				if application.IsShared && user.Owner != application.Organization {
+					var userOrg *object.Organization
+					userOrg, err = object.GetOrganizationByUser(user)
+					if err != nil {
+						c.ResponseError(err.Error())
+						return
+					}
+					if userOrg != nil {
+						userOrganization = userOrg
+					}
+				}
+
 				// Sign in via OAuth (want to sign up but already have account)
 				// sync info from 3rd-party if possible
-				_, err = object.SetUserOAuthProperties(organization, user, provider.Type, userInfo, token, provider.UserMapping)
+				_, err = object.SetUserOAuthProperties(userOrganization, user, provider.Type, userInfo, token, provider.UserMapping)
 				if err != nil {
 					c.ResponseError(err.Error())
 					return
 				}
 
-				if checkMfaEnable(c, user, organization, verificationType) {
+				if checkMfaEnable(c, user, userOrganization, verificationType) {
 					return
 				}
 
@@ -1382,7 +1452,7 @@ func (c *ApiController) Login() {
 			}
 
 			var oldUser *object.User
-			oldUser, err = getUserByProvider(application.Organization, provider, userInfo.Id)
+			oldUser, err = getUserByProvider(application, provider, userInfo)
 			if err != nil {
 				c.ResponseError(err.Error())
 				return

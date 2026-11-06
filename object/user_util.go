@@ -212,6 +212,24 @@ func getUserByNationalPhone(organization string, phone string) (*User, error) {
 	return nil, nil
 }
 
+// GetSharedApplicationOrganizations returns the names of the organizations that have
+// the given application as their default application — the organizations a shared
+// application serves besides its own (a shared application always belongs to
+// "built-in", which holds no real users).
+func GetSharedApplicationOrganizations(applicationName string) ([]string, error) {
+	var orgs []*Organization
+	err := ormer.Engine.Where("default_application = ?", applicationName).Find(&orgs)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(orgs))
+	for _, org := range orgs {
+		names = append(names, org.Name)
+	}
+	return names, nil
+}
+
 // GetUserByFieldsForSharedApp looks up a user for a shared application login.
 // If the application is shared and the user is not found in the given organization,
 // it searches all organizations that have this app as their default application.
@@ -222,17 +240,16 @@ func GetUserByFieldsForSharedApp(application *Application, organization string, 
 		return user, err
 	}
 
-	var orgs []*Organization
-	err = ormer.Engine.Where("default_application = ?", application.Name).Find(&orgs)
+	orgNames, err := GetSharedApplicationOrganizations(application.Name)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, org := range orgs {
-		if org.Name == organization {
+	for _, orgName := range orgNames {
+		if orgName == organization {
 			continue
 		}
-		user, err = GetUserByFields(org.Name, field)
+		user, err = GetUserByFields(orgName, field)
 		if err != nil {
 			return nil, err
 		}

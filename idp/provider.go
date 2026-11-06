@@ -27,6 +27,11 @@ type UserInfo struct {
 	Username    string
 	DisplayName string
 	UnionId     string
+	// CorpUserId is the enterprise-internal user id (DingTalk "userid") resolved
+	// through the provider's corporate API. The DingTalk syncer links synced users
+	// by this id in the binding column, while the OAuth flow identifies them by
+	// OpenId, so resolving the binding column must accept both.
+	CorpUserId string
 	Email       string
 	// EmailVerified reports whether the provider itself vouches for Email.
 	// Providers that make no such assertion leave it false.

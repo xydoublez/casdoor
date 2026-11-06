@@ -189,6 +189,9 @@ func (idp *DingTalkIdProvider) GetUserInfo(token *oauth2.Token) (*UserInfo, erro
 	if err != nil {
 		return nil, err
 	}
+	// the DingTalk syncer stores this corporate userid in the user's binding
+	// column, so login has to accept it next to the OpenId of this OAuth flow
+	userInfo.CorpUserId = userId
 
 	userDetail, err := idp.getUserCorpInfo(userId, corpAccessToken)
 	if err == nil {
