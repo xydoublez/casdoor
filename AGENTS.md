@@ -192,6 +192,15 @@ scripts/       # 启停脚本
   ```
 - **约定（防同类 BUG）**：API 型同步器（DingTalk/WeCom/Lark）写入绑定列的 ID 种类必须与对应 idp 的 `userInfo.Id` 语义对齐；无法对齐时（如钉钉同步器拿不到 per-app OpenId），登录查找必须接受同步器写入的 ID 作为候选。provider 登录的任何用户查找都必须与密码登录共享同一组织范围（含共享应用扩展）。
 
+### 7b. 统一门户（组织默认应用）登录因用户注册应用绑定而中断 MFA 设置 — 2026-11-10 修复
+
+- **症状**：组织默认应用（统一门户）配置钉钉等提供商登录、组织 MFA 规则 Required 时，`signupApplication` 绑定到其他应用（经其他应用注册/同步/历史数据）的用户扫码后登录流程中断：MFA 设置向导（`/mfa/setup`）按**用户注册应用**而非组织默认应用解析界面与提供商——注册应用已被删除或属组织所有时 `get-application?id=admin/<signupApplication>` 返回 `data:null`，向导第 2 步直接报错卡死，登录永远完不成；注册应用存在但未配 Email/SMS 提供商时，验证码发送/RADIUS/Push 提供商、国家码全部按错误应用解析，无法统一使用门户的提供商。
+- **根因**：后端 `/api/login` 全程按**登录应用**（state 携带）驱动且 §7 已保证用户查找与 MFA 策略按用户组织执行，唯独前端 `web/src/pages/auth/MfaSetupPage.tsx` 用 `account.signupApplication`（用户注册应用）优先解析向导所需应用（旧 antd 前端 `MfaSetupPage.js` 同源逻辑，`localStorage.applicationName` 回退在新前端无任何 setItem，恒空）。`RequiredMfa` 回弹链路（AuthCallback/SamlCallback/LoginPage → 控制台根 → `useRequiredMfaRedirect` → `/mfa/setup`）不携带登录应用名，向导无从得知门户应用。
+- **修复**：向导改为固定用 `OrganizationBackend.getDefaultApplication("admin", account.owner)` 解析**组织默认应用**（统一门户语义，与 `/login/<org>` 登录页同一解析链），失败再回退 `getUserApplication`（LDAP 同步用户、组织无默认应用兜底）；不再读 `account.signupApplication`。改完须重编前端（`cd web && yarn run build && touch web/build/index.html`）。
+- **验证**：mock Custom OAuth 提供商（等价钉钉链路）+ 组织 `torg`（defaultApplication=`app-portal`、MfaItems=[{app,Required}]）+ 用户 `torg/dtuser2`（signupApplication 指向 `app-orgapp`/`app-deleted`）：修复前服务端日志实测向导请求 `GET /api/get-application?id=admin/app-orgapp`（用户注册应用，注册应用缺失时 data:null → 卡死）；修复后向导请求 `get-default-application?id=admin/torg` → `app-portal`，TOTP initiate/verify/enable 全链路通过，再次扫码登录 → NextMfa → 输入 TOTP → `torg/dtuser2` 登录成功。测试数据保留在开发库（`torg` 组织、`app-portal`/`app-other`/`app-orgapp`、`mock-oauth` 提供商指向 127.0.0.1:9100 的本地 mock，mock 服务脚本已删）。
+- **约定（防同类 BUG）**：登录延续流程（MFA 设置/验证、验证码发送、prompt 页等）中需要「应用」的地方，**禁止**用 `account.signupApplication`（用户注册应用）解析，必须用登录应用（state/URL 携带）或组织默认应用（`get-default-application`）；`signupApplication` 只属于注册与管理场景。
+- **演变链**：旧 antd `MfaSetupPage.js`（signupApplication 优先 + entry 应用回退）→ shadcn 重写（回退项失活，仅剩 signupApplication）→ 本次修复（固定组织默认应用）。
+
 ### 8. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
@@ -213,3 +222,4 @@ scripts/       # 启停脚本
 | 日志/令牌/会话等列表按 `user` 等 PG 保留字列搜索恒空（裸 SQL 条件列名过 `quoteColumn`，见上文 §5） | 2026-11-04 本次修复 | `object/ormer_session.go` `GetSession`/`GetSessionForUser` | 在位 |
 | 删除权限先回读库中完整对象再清理 Casbin 策略（请求体只带 owner/name 也不再残留 `permission_rule` 行，见上文 §6） | 2026-11-05 本次修复 | `object/permission.go` `DeletePermission` | 在位 |
 | 钉钉扫码登录绑定后恒报账户不存在（同步器写 userid 到绑定列 vs OAuth 按 OpenId 查；provider 登录缺共享应用组织范围，见上文 §7） | 2026-11-05 本次修复 | `idp/dingtalk.go` + `idp/provider.go` `UserInfo.CorpUserId` + `controllers/auth.go` `providerLoginIds`/`providerLookupOrganizations` + `object/user_util.go` `GetSharedApplicationOrganizations` | 在位 |
+| 统一门户 MFA 设置向导按用户注册应用解析界面/提供商导致卡死或提供商错位（改用组织默认应用，见上文 §7b） | 2026-11-10 本次修复 | `web/src/pages/auth/MfaSetupPage.tsx` | 在位 |
