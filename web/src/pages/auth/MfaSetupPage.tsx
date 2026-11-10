@@ -72,23 +72,38 @@ export default function MfaSetupPage() {
     if (!account) {
       return;
     }
+    let cancelled = false;
     // The wizard belongs to the organization's default application — the unified
-    // portal every sign-in goes through — never to the user's registration
+    // portal every sign-in goes through — rather than to the user's registration
     // application: a user whose "signupApplication" is bound to another app (or
     // to an org-owned or deleted one) must still get the default application's
     // providers, country codes and branding here, or the required-MFA sign-in
-    // cannot be finished at all.
+    // cannot be finished at all. The user-aware endpoint below only serves as a
+    // fallback for organizations without a resolvable default application, where
+    // it may still resolve the registration application — better than blocking
+    // the wizard outright.
     OrganizationBackend.getDefaultApplication("admin", account.owner)
-      .catch(() => ({status: "error"}))
+      .catch((error: any) => ({status: "error", msg: String(error)}))
       .then((res: any) => {
         if (res?.status === "ok" && res?.data) {
           return res;
         }
         // An organization may have no default application (e.g. LDAP-synced
-        // users), fall back to the user-aware endpoint.
-        return ApplicationBackend.getUserApplication(account.owner, account.name);
+        // users), fall back to the user-aware endpoint. When that fails too,
+        // prefer its message and keep the default application's reason.
+        return ApplicationBackend.getUserApplication(account.owner, account.name)
+          .catch(() => null)
+          .then((userRes: any) => {
+            if (userRes?.status === "ok" && userRes?.data) {
+              return userRes;
+            }
+            return {status: "error", msg: userRes?.msg ?? res?.msg};
+          });
       })
       .then((res: any) => {
+        if (cancelled) {
+          return;
+        }
         if (res?.status === "error" || !res?.data) {
           const msg = res?.msg ?? i18next.t("general:Failed to get");
           setApplicationError(msg);
@@ -99,9 +114,15 @@ export default function MfaSetupPage() {
         setApplication(res.data);
       })
       .catch((error: any) => {
+        if (cancelled) {
+          return;
+        }
         setApplicationError(String(error));
         setApplication(null);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [account]);
 
   const initMfaProps = React.useCallback(() => {
