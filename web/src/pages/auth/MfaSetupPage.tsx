@@ -20,6 +20,7 @@ import {
 import {useAccount} from "@/hooks/use-account";
 import * as ApplicationBackend from "@/backend/ApplicationBackend";
 import * as MfaBackend from "@/backend/MfaBackend";
+import * as OrganizationBackend from "@/backend/OrganizationBackend";
 import * as Setting from "@/lib/setting";
 
 const MFA_TYPE_LABELS: {type: string; labelKey: string}[] = [
@@ -71,14 +72,22 @@ export default function MfaSetupPage() {
     if (!account) {
       return;
     }
-    // LDAP-synced users can have an empty "signupApplication", so fall back to
-    // the user-aware endpoint.
-    const applicationName = account.signupApplication ?? localStorage.getItem("applicationName") ?? "";
-    const promise = applicationName
-      ? ApplicationBackend.getApplication("admin", applicationName)
-      : ApplicationBackend.getUserApplication(account.owner, account.name);
-
-    promise
+    // The wizard belongs to the organization's default application — the unified
+    // portal every sign-in goes through — never to the user's registration
+    // application: a user whose "signupApplication" is bound to another app (or
+    // to an org-owned or deleted one) must still get the default application's
+    // providers, country codes and branding here, or the required-MFA sign-in
+    // cannot be finished at all.
+    OrganizationBackend.getDefaultApplication("admin", account.owner)
+      .catch(() => ({status: "error"}))
+      .then((res: any) => {
+        if (res?.status === "ok" && res?.data) {
+          return res;
+        }
+        // An organization may have no default application (e.g. LDAP-synced
+        // users), fall back to the user-aware endpoint.
+        return ApplicationBackend.getUserApplication(account.owner, account.name);
+      })
       .then((res: any) => {
         if (res?.status === "error" || !res?.data) {
           const msg = res?.msg ?? i18next.t("general:Failed to get");
