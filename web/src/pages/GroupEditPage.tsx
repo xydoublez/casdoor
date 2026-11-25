@@ -62,6 +62,9 @@ export default function GroupEditPage() {
       name: "manager",
       labelKey: "group:Manager",
       options: () => [{value: "", label: "-"}, ...users.options],
+      onSearch: users.onSearch,
+      onLoadMore: users.onLoadMore,
+      hasMore: users.hasMore,
     },
     {
       // read-only: membership is edited from the user page, as in the antd frontend

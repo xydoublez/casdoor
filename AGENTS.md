@@ -128,7 +128,7 @@ scripts/       # 启停脚本
 
 - **症状**：角色/权限等编辑页的「包含用户」多选搜索 `lizhiqiang` 显示「暂无数据」，但该用户真实存在（用户列表页同名服务端搜索可命中）；组织用户数超过 1000 时，第一页之外的任何用户都搜不到、选不中。
 - **根因**：shadcn 重写后 `web/src/hooks/use-options.ts` 的 `useUserOptions`/`useUserNameOptions` 只取 `get-users` 第一页（`PAGE_SIZE=1000`），`MultiSelect`/`SearchableSelect` 用 cmdk `filter` 纯客户端过滤；按 `created_time` 倒序排在第一页之外的用户永远进不了选项列表。旧 antd 前端此处是 `web-old/src/common/PaginateSelect.js` 的服务端搜索（`field=name`）+ `onPopupScroll` 滚动翻页，重写时语义丢失——与 §2 同属「前端换壳后旧前端能力/修复未移植」。
-- **修复**：hook 返回 `RemoteOptions {options, onSearch, onLoadMore, hasMore}`：输入防抖 300ms 走后端 `name`/`displayName` 双路 LIKE 搜索合并去重；下拉滚到底追加下一页（基础 1000/页、搜索 100/页）；ticket/seq 作废在途旧响应防竞态；关闭下拉重置回基础页；`MultiSelect`/`SearchableSelect` 新增 `onSearch`/`onLoadMore`/`hasMore`（远程模式跳过本地过滤）并以标签缓存保证已选徽章换页后不丢显示名；`SimpleEditPage` 的 select/multiselect 透传三 prop，接入 Role、Permission、Order、Pricing、Ticket、Transaction、Coupon、Subscription、Payment、Key 共 10 个编辑页；后端 `object/ormer_session.go` `GetSessionForUser` 分页分支在排序列后追加 `owner,name` 确定性 tiebreaker——LDAP 批量同步会给成千用户写同一秒 `created_time`，无 tiebreaker 时并列行在两次分页查询间顺序不保证，滚动翻页可能漏行（万人组织必现级风险）。
+- **修复**：hook 返回 `RemoteOptions {options, onSearch, onLoadMore, hasMore}`：输入防抖 300ms 走后端 `name`/`displayName` 双路 LIKE 搜索合并去重；下拉滚到底追加下一页（基础 1000/页、搜索 100/页）；ticket/seq 作废在途旧响应防竞态；关闭下拉重置回基础页；`MultiSelect`/`SearchableSelect` 新增 `onSearch`/`onLoadMore`/`hasMore`（远程模式跳过本地过滤）并以标签缓存保证已选徽章换页后不丢显示名；`SimpleEditPage` 的 select/multiselect 透传三 prop，接入 Role、Permission、Order、Pricing、Ticket、Transaction、Coupon、Subscription、Payment、Key 共 10 个编辑页；合并上游后新增页面再补齐同类接入：Agent、Group（manager）、Flow（测试面板）、AccessReview、PrivilegedAccount、EnterprisePolicyTab（`0b1fa1bf`）——**新增页面若带用户下拉，合并时必须同步接入这三 prop**；后端 `object/ormer_session.go` `GetSessionForUser` 分页分支在排序列后追加 `owner,name` 确定性 tiebreaker——LDAP 批量同步会给成千用户写同一秒 `created_time`，无 tiebreaker 时并列行在两次分页查询间顺序不保证，滚动翻页可能漏行（万人组织必现级风险）。
 - **验证**：`npx tsc --noEmit` 通过并重编前端；开发库注入 1008 用户（`lizhiqiang` 排在 1000 名外）浏览器实测：下拉打开 1000 项 → 滚到底自动增至 1008 项、搜索 `lizhiqiang` 命中 1 项可勾选；测试数据已清理。
 - **回归测试**：`object/user_pagination_tie_test.go`（同 `created_time` 120 用户倒序插入：分页无遗漏/无重叠、遍历序等于 tiebreaker 序、同页重复查询不漂移、搜索路径分页完整；移除 tiebreaker 后该测试立即失败）：
 
@@ -201,7 +201,7 @@ scripts/       # 启停脚本
 - **约定（防同类 BUG）**：登录延续流程（MFA 设置/验证、验证码发送、prompt 页等）中需要「应用」的地方，**禁止**用 `account.signupApplication`（用户注册应用）解析，必须用登录应用（state/URL 携带）或组织默认应用（`get-default-application`）；`signupApplication` 只属于注册与管理场景。
 - **演变链**：旧 antd `MfaSetupPage.js`（signupApplication 优先 + entry 应用回退）→ shadcn 重写（回退项失活，仅剩 signupApplication）→ 本次修复（固定组织默认应用）。
 
-### 8. 其余本地修复清单（2026-10-29 已核对在位，合并后需复查）
+### 8. 其余本地修复清单（最近核对 2026-11-25，合并后需复查）
 
 | 修复 | 引入提交 | 位置 | 状态 |
 |---|---|---|---|
@@ -216,10 +216,12 @@ scripts/       # 启停脚本
 | 面包屑 safeDecodeURIComponent 解码（CJK 组名不显示百分号编码） | `f13a408d`（2026-10-29 重新应用到新前端，见上文 §2） | `web/src/components/layout/BreadcrumbBar.tsx` + `web-old/src/common/BreadcrumbBar.js` | 在位 |
 | goroutine panic 打印调用堆栈 | `13cd8e59` | `util/routine.go` `SafeGoroutine` | 在位 |
 | 上游 web/web2 目录重命名适配（后端仅服务 `web/build`） | `c4591a5f` | `scripts/start_pg.sh` 等 | 在位 |
-| 用户下拉服务端搜索 + 滚动翻页（`RemoteOptions`，恢复 antd PaginateSelect 语义，见上文 §3） | 2026-10-30 本次修复 | `web/src/hooks/use-options.ts` + `web/src/components/common/MultiSelect.tsx`/`SearchableSelect.tsx` + `web/src/components/crud/SimpleEditPage.tsx` | 在位 |
+| 用户下拉服务端搜索 + 滚动翻页（`RemoteOptions`，恢复 antd PaginateSelect 语义，见上文 §3） | 2026-10-30 本次修复 | `web/src/hooks/use-options.ts` + `web/src/components/common/MultiSelect.tsx`/`SearchableSelect.tsx` + `web/src/components/crud/SimpleEditPage.tsx` | 在位（`0b1fa1bf` 补接上游新增页面） |
 | 联合登录/社交扫码（钉钉等）+ MFA 后跳转前刷新账号（恢复 antd `onLoginSuccess`→`getAccount` 语义，见上文 §4） | 2026-11-03 本次修复 | `web/src/pages/auth/AuthCallback.tsx` + `web/src/pages/auth/SamlCallback.tsx` | 在位 |
 | CAS 退出后先清空账号上下文再跳 CAS 登录页（避免闪现「使用当前账号登录」） | 2026-11-03 本次修复 | `web/src/pages/auth/CasLogout.tsx` `finish()` | 在位 |
 | 日志/令牌/会话等列表按 `user` 等 PG 保留字列搜索恒空（裸 SQL 条件列名过 `quoteColumn`，见上文 §5） | 2026-11-04 本次修复 | `object/ormer_session.go` `GetSession`/`GetSessionForUser` | 在位 |
 | 删除权限先回读库中完整对象再清理 Casbin 策略（请求体只带 owner/name 也不再残留 `permission_rule` 行，见上文 §6） | 2026-11-05 本次修复 | `object/permission.go` `DeletePermission` | 在位 |
 | 钉钉扫码登录绑定后恒报账户不存在（同步器写 userid 到绑定列 vs OAuth 按 OpenId 查；provider 登录缺共享应用组织范围，见上文 §7） | 2026-11-05 本次修复 | `idp/dingtalk.go` + `idp/provider.go` `UserInfo.CorpUserId` + `controllers/auth.go` `providerLoginIds`/`providerLookupOrganizations` + `object/user_util.go` `GetSharedApplicationOrganizations` | 在位 |
 | 统一门户 MFA 设置向导按用户注册应用解析界面/提供商导致卡死或提供商错位（改用组织默认应用，见上文 §7b） | 2026-11-10 本次修复 | `web/src/pages/auth/MfaSetupPage.tsx` | 在位 |
+| 轻量回调页在无 vite dev server 时回退到当前 origin（原先硬编码 `8000→7001` 移交，未探测存活，登录流程停在死端口） | `624a40e0`（2026-11-03） | `web/public/AuthCallbackHandler.js` `resolveReactOrigin` | 在位 |
+| 用户列表「重置 MFA」操作（全局管理员可重置任意组织、组织管理员限本组织；调用 `MfaBackend.DeleteMfa`） | `ac0d1e8d`（2026-11-25） | `web/src/pages/UserListPage.tsx` + `web/src/locales/*/data.json` | 在位 |
