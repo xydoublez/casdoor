@@ -91,7 +91,7 @@ func TestRoleWithParentGroupGrantsTwoApplications(t *testing.T) {
 	addPermission(t, appPerm)
 
 	// ---- 5. 验证 1: 角色继承（子群组用户 → 父群组角色）----
-	roles, err := getRolesByUser(alice.GetId())
+	roles, err := GetRolesByUser(alice.GetId())
 	mustErr(t, err)
 	var roleIds []string
 	hit := false

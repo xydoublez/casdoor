@@ -177,7 +177,7 @@ function TestPanel({record, onResults}: {record: any; onResults: (results: Recor
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <label className="space-y-1 text-sm">
             <span className="text-muted-foreground">{i18next.t("general:User")}</span>
-            <SearchableSelect value={user} onChange={setUser} options={users} />
+            <SearchableSelect value={user} onChange={setUser} options={users.options} onSearch={users.onSearch} onLoadMore={users.onLoadMore} hasMore={users.hasMore} />
           </label>
           <label className="space-y-1 text-sm">
             <span className="text-muted-foreground">{i18next.t("general:Application")}</span>

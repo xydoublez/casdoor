@@ -38,7 +38,7 @@ export default function AgentEditPage() {
         </p>
       ),
     },
-    {type: "select", name: "manager", labelKey: "group:Manager", options: () => users},
+    {type: "select", name: "manager", labelKey: "group:Manager", options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "switch", name: "isForbidden", labelKey: "user:Is forbidden"},
   ];
 

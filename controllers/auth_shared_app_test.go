@@ -67,7 +67,8 @@ func TestSharedAppBindingRuleFindsUser(t *testing.T) {
 	providerItem := &object.ProviderItem{Name: "dingtalk"}
 	userInfo := &idp.UserInfo{Email: env.email, EmailVerified: true}
 
-	user, err := getExistUserByBindingRule(providerItem, env.sharedApp, userInfo)
+	provider := &object.Provider{Name: "dingtalk", Type: "DingTalk"}
+	user, err := getExistUserByBindingRule(providerItem, provider, env.sharedApp, userInfo)
 	mustNoErr(t, err)
 	if user == nil {
 		t.Fatal("binding rule must resolve the user by verified email across the shared application's organizations")

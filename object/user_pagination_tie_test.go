@@ -53,7 +53,7 @@ func TestPaginationUsersTieBreaker(t *testing.T) {
 	seen := map[string]int{}
 	var walked []string
 	for offset := 0; offset < total; offset += pageSize {
-		page, err := GetPaginationUsers(owner, offset, pageSize, "", "", "", "", "")
+		page, err := GetPaginationUsers(owner, offset, pageSize, "", "", "", "", "", "")
 		mustErr(t, err)
 		want := pageSize
 		if rest := total - offset; rest < want {
@@ -82,9 +82,9 @@ func TestPaginationUsersTieBreaker(t *testing.T) {
 	}
 
 	// the same page twice must come back in the same sequence
-	first, err := GetPaginationUsers(owner, pageSize, pageSize, "", "", "", "", "")
+	first, err := GetPaginationUsers(owner, pageSize, pageSize, "", "", "", "", "", "")
 	mustErr(t, err)
-	again, err := GetPaginationUsers(owner, pageSize, pageSize, "", "", "", "", "")
+	again, err := GetPaginationUsers(owner, pageSize, pageSize, "", "", "", "", "", "")
 	mustErr(t, err)
 	if len(first) != len(again) {
 		t.Fatalf("page size drifted: %d then %d", len(first), len(again))
@@ -98,7 +98,7 @@ func TestPaginationUsersTieBreaker(t *testing.T) {
 	// the search path paginates through the same session: matches page without gaps too
 	var searched []string
 	for offset := 0; offset < total; offset += 60 {
-		page, err := GetPaginationUsers(owner, offset, 60, "name", "tie-", "", "", "")
+		page, err := GetPaginationUsers(owner, offset, 60, "name", "tie-", "", "", "", "")
 		mustErr(t, err)
 		for _, u := range page {
 			searched = append(searched, u.Name)

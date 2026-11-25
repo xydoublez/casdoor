@@ -144,7 +144,7 @@ export default function AccessReviewEditPage() {
         {value: "Reviewers", label: i18next.t("enterprise:The reviewers below, in turn")},
       ],
     },
-    {type: "multiselect", name: "reviewers", labelKey: "enterprise:Reviewers", disabled: isRunning, options: () => users},
+    {type: "multiselect", name: "reviewers", labelKey: "enterprise:Reviewers", disabled: isRunning, options: () => users.options, onSearch: users.onSearch, onLoadMore: users.onLoadMore, hasMore: users.hasMore},
     {type: "number", name: "durationDays", labelKey: "enterprise:Review period (days)", min: 1, max: 365, disabled: isRunning},
     {
       type: "select",

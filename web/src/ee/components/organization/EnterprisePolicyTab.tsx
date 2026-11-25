@@ -148,7 +148,7 @@ export function EnterprisePolicyTab({owner, policy, onChange}: {owner: string; p
   );
   const admins = (key: string, labelKey: string) => (
     <FormRow labelKey={labelKey}>
-      <MultiSelect value={value[key] ?? []} onChange={(v) => set(key, v)} options={userOptions} />
+      <MultiSelect value={value[key] ?? []} onChange={(v) => set(key, v)} options={userOptions.options} onSearch={userOptions.onSearch} onLoadMore={userOptions.onLoadMore} hasMore={userOptions.hasMore} />
     </FormRow>
   );
   const setRule = (index: number, rule: any) => set("sodRules", rules.map((item, i) => (i === index ? rule : item)));
@@ -253,7 +253,10 @@ export function EnterprisePolicyTab({owner, policy, onChange}: {owner: string; p
               className="w-48"
               value={item.user ?? ""}
               onChange={(v) => setDelegatedAdmin(index, {...item, user: v})}
-              options={userOptions}
+              options={userOptions.options}
+              onSearch={userOptions.onSearch}
+              onLoadMore={userOptions.onLoadMore}
+              hasMore={userOptions.hasMore}
               placeholder={i18next.t("general:User")}
             />
             <MultiSelect
