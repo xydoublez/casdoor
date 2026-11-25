@@ -21,6 +21,7 @@ import {boolColumn, dateColumn, linkColumn, organizationColumn, textColumn} from
 import type {ColumnDef} from "@/components/crud/types";
 import {useAccount} from "@/hooks/use-account";
 import {useRequestOrganization} from "@/hooks/use-organization";
+import * as MfaBackend from "@/backend/MfaBackend";
 import * as OrganizationBackend from "@/backend/OrganizationBackend";
 import * as UserBackend from "@/backend/UserBackend";
 import * as Setting from "@/lib/setting";
@@ -50,6 +51,10 @@ export default function UserListPage({
   const isProtected = (record: any) =>
     (record.owner === account?.owner && record.name === account?.name) ||
     (record.owner === "built-in" && record.name === "admin");
+
+  // a global admin may reset MFA anywhere, an organization admin only in its own organization
+  const canResetMfa = (record: any) =>
+    Setting.isLocalAdminUser(account) && (account?.owner === "built-in" || account?.owner === record.owner);
 
   const [organization, setOrganization] = React.useState<any>({});
   // "enabled" lists the users who can sign in, "disabled" the forbidden or deleted ones
@@ -360,6 +365,29 @@ export default function UserListPage({
                 }
               });
             },
+          }
+          : null,
+        canResetMfa(record)
+          ? {
+            key: "resetMfa",
+            label: i18next.t("mfa:Reset MFA"),
+            destructive: true,
+            confirm: {
+              title: i18next.t("mfa:Sure to reset MFA"),
+              description: i18next.t("mfa:Reset MFA description"),
+            },
+            onSelect: () =>
+              MfaBackend.DeleteMfa({owner: record.owner, name: record.name})
+                .then((res: any) => {
+                  if (res.status === "ok") {
+                    Setting.showMessage("success", i18next.t("mfa:MFA reset successfully"));
+                  } else {
+                    Setting.showMessage("error", `${i18next.t("mfa:Failed to reset MFA")}: ${res.msg}`);
+                  }
+                })
+                .catch((error) =>
+                  Setting.showMessage("error", `${i18next.t("general:Failed to connect to server")}: ${error}`),
+                ),
           }
           : null,
         // only offered while the list is scoped to a group, as on the group tree page
